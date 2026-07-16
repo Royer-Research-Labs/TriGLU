@@ -1,0 +1,59 @@
+model:
+  vocab_size: 50304
+  n_layers: 12
+  d_model: 512
+  n_heads: 8
+  ffn_hidden_size: 1376
+  context_length: 1024
+  dropout: 0.0
+  bias: false
+  rope_theta: 10000.0
+  norm_eps: 1.0e-5
+  init_std: 0.02
+  tie_embeddings: true
+  layer_types:
+    - attention
+    - triglu
+    - attention
+    - triglu
+    - attention
+    - triglu
+    - attention
+    - triglu
+    - attention
+    - triglu
+    - attention
+    - triglu
+
+data:
+  synthetic: false
+  vocab_size: 50304
+  train_path: data/fineweb_edu_10bt/train.bin
+  val_path: data/fineweb_edu_10bt/val.bin
+  train_tokens: 200000000
+  val_tokens: 5000000
+  seed: 1337
+
+training:
+  output_dir: runs/12l_1k_100m/6a6t
+  device: auto
+  dtype: auto
+  compile: true
+  batch_size: 4
+  sequence_length: 1024
+  gradient_accumulation_steps: 16
+  max_steps: 1526
+  learning_rate: 0.0003
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  fused_optimizer: true
+  log_interval: 10
+  eval_interval: 100
+  eval_batches: 50
+  checkpoint_interval: 0
+  seed: 1337

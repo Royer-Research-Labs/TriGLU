@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use TriGLU, please cite this software."
+title: "TriGLU: Controlled Attention-Replacement Ablations"
+type: software
+authors:
+  - family-names: Royer
+    given-names: Nick
+    affiliation: "Royer Research Labs, LLC"
+version: 0.1.0
+date-released: 2026-07-16
+license: Apache-2.0
+repository-code: "https://github.com/Royer-Research-Labs/TriGLU"

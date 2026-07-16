@@ -1,0 +1,48 @@
+model:
+  vocab_size: 256
+  n_layers: 2
+  d_model: 64
+  n_heads: 1
+  ffn_hidden_size: 176
+  context_length: 16
+  dropout: 0.0
+  bias: false
+  rope_theta: 10000.0
+  norm_eps: 1.0e-5
+  init_std: 0.02
+  tie_embeddings: true
+  layer_types:
+    - attention
+    - triglu
+
+data:
+  synthetic: true
+  vocab_size: 256
+  train_tokens: 4096
+  val_tokens: 1024
+  pattern_length: 64
+  seed: 1234
+
+training:
+  output_dir: runs/smoke
+  device: cpu
+  dtype: float32
+  compile: false
+  batch_size: 2
+  sequence_length: 16
+  gradient_accumulation_steps: 1
+  max_steps: 3
+  learning_rate: 0.001
+  min_lr_ratio: 0.1
+  warmup_steps: 1
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  fused_optimizer: false
+  log_interval: 1
+  eval_interval: 2
+  eval_batches: 2
+  checkpoint_interval: 2
+  seed: 1234

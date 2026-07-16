@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triglu"
+version = "0.1.0"
+description = "Token-local triple-product gating for selectively replacing attention in decoder-only Transformers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+  { name = "Nick Royer" },
+]
+maintainers = [
+  { name = "Royer Research Labs, LLC" },
+]
+
+dependencies = [
+  "PyYAML>=6.0",
+  "torch>=2.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/Royer-Research-Labs/TriGLU"
+Repository = "https://github.com/Royer-Research-Labs/TriGLU.git"
+Issues = "https://github.com/Royer-Research-Labs/TriGLU/issues"
+
+[project.optional-dependencies]
+data = [
+  "datasets>=2.18",
+  "tiktoken>=0.7",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+triglu-train = "triglu.train:main"
+triglu-evaluate = "triglu.evaluate:main"
+triglu-benchmark = "triglu.benchmark:main"
+triglu-prepare-data = "triglu.prepare_data:main"
+triglu-analyze-rank = "triglu.analyze_rank:main"
+triglu-report = "triglu.report:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

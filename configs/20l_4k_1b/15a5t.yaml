@@ -1,0 +1,68 @@
+model:
+  vocab_size: 50304
+  n_layers: 20
+  d_model: 512
+  n_heads: 8
+  ffn_hidden_size: 1376
+  context_length: 4096
+  dropout: 0.0
+  bias: false
+  rope_theta: 10000.0
+  norm_eps: 1.0e-5
+  init_std: 0.02
+  tie_embeddings: true
+  # Uniform reference: three attention layers precede each TriGLU layer.
+  layer_types:
+    - attention
+    - attention
+    - attention
+    - triglu
+    - attention
+    - attention
+    - attention
+    - triglu
+    - attention
+    - attention
+    - attention
+    - triglu
+    - attention
+    - attention
+    - attention
+    - triglu
+    - attention
+    - attention
+    - attention
+    - triglu
+
+data:
+  synthetic: false
+  vocab_size: 50304
+  train_path: data/fineweb_edu_10bt_1b/train.bin
+  val_path: data/fineweb_edu_10bt_1b/val.bin
+  train_tokens: 1000000000
+  val_tokens: 5000000
+  seed: 1337
+
+training:
+  output_dir: runs/20l_4k_1b/15a5t
+  device: auto
+  dtype: auto
+  compile: true
+  batch_size: 16
+  sequence_length: 4096
+  gradient_accumulation_steps: 1
+  max_steps: 15259
+  learning_rate: 0.0003
+  min_lr_ratio: 0.1
+  warmup_steps: 1000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  fused_optimizer: true
+  log_interval: 10
+  eval_interval: 250
+  eval_batches: 16
+  checkpoint_interval: 0
+  seed: 1337

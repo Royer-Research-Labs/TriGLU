@@ -1,0 +1,75 @@
+################################################################################
+# TriGLU — authoritative framework-agnostic reference
+#
+# Shapes are [batch B, tokens T, channels C]. Every TriGLU operation acts
+# independently at each token. RoPE is position-dependent but does not mix tokens.
+################################################################################
+
+
+# Parameters of the attention-replacement component:
+#   W_kgv : linear C -> 3C, optionally biased
+#   W_o   : linear C -> C, optionally biased
+#   rope  : rotary embedding over the full C-wide last axis
+
+
+function triglu(X, cache = None, cache_position = 0, use_cache = false):
+    # X: [B, T, C]
+
+    # One fused projection produces three full-width channel streams.
+    KGV = W_kgv(X)                               # [B, T, 3C]
+    K, G, V = split_last_axis(KGV, into = 3)    # each [B, T, C]
+
+    # Rotate K only. Token t is rotated by its own absolute position.
+    K = rope(K, offset = cache_position)         # [B, T, C]
+
+    # Exact TriGLU equation; both products are elementwise.
+    Y = K * silu(G)                              # [B, T, C]
+    Y = Y * V                                    # [B, T, C]
+    Y = W_o(Y)                                   # [B, T, C]
+
+    # No K/V history is stored. The integer is position metadata only.
+    triglu_cache = (None, None, cache_position + T) if use_cache else None
+    return Y, triglu_cache
+
+
+################################################################################
+# Controlled decoder integration
+#
+# Attention and TriGLU use the same conventional two-sublayer, pre-norm
+# decoder wrapper. Thus the explicit layer plan changes only the mixer.
+################################################################################
+
+
+function decoder_block(
+    X,
+    mixer,
+    cache_position = 0,
+    cache = None,
+    use_cache = false,
+):
+    Y, next_cache = mixer(
+        rms_norm_1(X),
+        cache = cache,
+        cache_position = cache_position,
+        use_cache = use_cache,
+    )
+    X = X + Y
+    X = X + swiglu(rms_norm_2(X))
+    return X, next_cache
+
+
+################################################################################
+# Autoregressive decoding note
+#
+# TriGLU token t depends only on token t plus its absolute position. TriGLU
+# layers therefore keep no growing KV cache. Only retained attention layers do.
+################################################################################
+
+
+################################################################################
+# Hybrid stack
+#
+# layer_types is an explicit per-layer choice from {attention, triglu}.
+# Retained attention layers provide all cross-token information flow. An all-TriGLU
+# stack is useful only as a no-cross-token-mixing diagnostic negative control.
+################################################################################
