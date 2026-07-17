@@ -1,5 +1,7 @@
 # TriGLU: a token-local gated alternative to selected attention layers
 
+[![tests](https://github.com/Royer-Research-Labs/TriGLU/actions/workflows/tests.yml/badge.svg)](https://github.com/Royer-Research-Labs/TriGLU/actions/workflows/tests.yml)
+
 TriGLU—the **Triple-Product Gated Linear Unit**—is a token-local channel mixer designed
 for use in place of selected causal-attention sublayers. It applies three projected
 factors at each token independently and requires no KV cache. This repository provides
