@@ -38,10 +38,11 @@ PyTorch version. Keep those settings identical across plans; never silently redu
 batch after an out-of-memory error.
 
 Inference reports prefill and cached-decode throughput separately. Only attention layers
-have growing logical key/value content; TriGLU layers retain position metadata only.
-The benchmark preallocates attention cache capacity to avoid timing repeated history
-copies. Record context length, generated length, batch size, peak allocated memory,
-logically used cache bytes, and allocated cache capacity.
+have growing logical key/value content; TriGLU and the explicitly labeled token-local
+controls retain position metadata only. The benchmark preallocates attention cache
+capacity to avoid timing repeated history copies. Record context length, generated
+length, batch size, peak allocated memory, logically used cache bytes, and allocated
+cache capacity.
 
 Context lengths above a checkpoint's training configuration may be used to measure
 architecture-level runtime and memory scaling when the benchmark records both configured
@@ -85,6 +86,12 @@ removed jointly.
   benchmark families; and
 - SVG files visualize quality/throughput, learning curves, activation geometry, update
   scale, and intervention sensitivity.
+
+The summary tables expose `attention_layers`, `token_local_layers`, and
+`replacement_mixers`, plus a count for each supported replacement type. This keeps
+secondary-control runs distinguishable instead of folding every token-local layer into
+the TriGLU count. Architecture names are derived from the run directory after removing a
+trailing `_seed<integer>` replication suffix.
 
 The reporter can be rerun after new raw artifacts arrive. Derived files should not be
 edited by hand.

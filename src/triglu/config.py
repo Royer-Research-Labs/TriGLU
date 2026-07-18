@@ -6,7 +6,15 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
 
-_LAYER_TYPES = frozenset({"attention", "triglu"})
+_LAYER_TYPES = frozenset(
+    {
+        "attention",
+        "triglu",
+        "triglu_no_rope",
+        "mb_mlp",
+        "swiglu_mixer",
+    }
+)
 
 
 @dataclass
@@ -15,7 +23,7 @@ class ModelConfig:
 
     The defaults describe the canonical 12-layer, width-512 model.  A different
     depth should also supply ``layer_types`` explicitly; requiring one entry per
-    layer keeps the attention/TriGLU plan visible in every experiment.
+    layer keeps the attention/replacement plan visible in every experiment.
     """
 
     vocab_size: int = 50_304
@@ -24,15 +32,19 @@ class ModelConfig:
     n_heads: int = 8
     ffn_hidden_size: int = 1_376
     context_length: int = 1_024
-    # Reaches only attention weights inside SDPA. TriGLU, SwiGLU, and the
-    # residual stream carry no dropout, so a nonzero value regularizes the
-    # retained attention layers alone — keep 0.0 for controlled comparisons.
+    # Reaches only attention weights inside SDPA. Token-local mixers and the
+    # residual stream carry no dropout, so a nonzero value regularizes retained
+    # attention layers alone — keep 0.0 for controlled comparisons.
     dropout: float = 0.0
     bias: bool = False
     rope_theta: float = 10_000.0
     norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
+    # Required only by the two-factor SwiGLU attention-slot control. Keeping
+    # this width explicit makes its near-parameter-matching choice part of the
+    # resolved experiment record instead of an implementation-side convention.
+    swiglu_mixer_hidden_size: int | None = None
     layer_types: list[str] = field(
         default_factory=lambda: ["attention"] * 12
     )
@@ -111,6 +123,24 @@ class ModelConfig:
             allowed = ", ".join(sorted(_LAYER_TYPES))
             raise ValueError(
                 f"unsupported layer type(s) {invalid}; expected only {allowed}"
+            )
+
+        uses_swiglu_mixer = "swiglu_mixer" in self.layer_types
+        hidden_size = self.swiglu_mixer_hidden_size
+        if uses_swiglu_mixer:
+            if (
+                isinstance(hidden_size, bool)
+                or not isinstance(hidden_size, int)
+                or hidden_size <= 0
+            ):
+                raise ValueError(
+                    "swiglu_mixer_hidden_size must be a positive integer when "
+                    "layer_types contains 'swiglu_mixer'"
+                )
+        elif hidden_size is not None:
+            raise ValueError(
+                "swiglu_mixer_hidden_size must be null unless layer_types contains "
+                "'swiglu_mixer'"
             )
 
     @property

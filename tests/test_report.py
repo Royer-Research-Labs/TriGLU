@@ -227,3 +227,36 @@ def test_architecture_delta_uses_only_seed_matched_baselines(tmp_path) -> None:
     assert hybrid["matched_baseline_runs"] == 1
     assert hybrid["matched_baseline_seeds"] == "0"
     assert hybrid["loss_delta_vs_baseline_mean"] == pytest.approx(0.1)
+
+
+def test_report_labels_every_token_local_ablation_layer(tmp_path) -> None:
+    runs = tmp_path / "runs"
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_run(runs, "2a0t", ["attention", "attention"], 2.0, 100.0)
+    variants = ("triglu", "triglu_no_rope", "mb_mlp", "swiglu_mixer")
+    for index, layer_type in enumerate(variants, 1):
+        _write_run(
+            runs,
+            f"1a1_{layer_type}",
+            ["attention", layer_type],
+            2.0 + index / 10,
+            100.0 + index,
+        )
+
+    report = generate_report(runs_root=runs, results_root=results, suite="suite")
+    by_architecture = {
+        row["architecture"]: row for row in report["architectures"]
+    }
+    for layer_type in variants:
+        row = by_architecture[f"1a1_{layer_type}"]
+        assert row["attention_layers"] == 1
+        assert row["token_local_layers"] == 1
+        assert row["replacement_mixers"] == f"{layer_type}:1"
+        assert row[f"{layer_type}_layers"] == 1
+
+    summary_header = (
+        results / "suite-report" / "summary.csv"
+    ).read_text(encoding="utf-8").splitlines()[0]
+    assert "token_local_layers" in summary_header
+    assert "replacement_mixers" in summary_header

@@ -7,7 +7,9 @@ for use in place of selected causal-attention sublayers. It applies three projec
 factors at each token independently and requires no KV cache. This repository provides
 both a small, readable PyTorch implementation and a controlled decoder-only Transformer
 harness for measuring quality, training throughput, inference throughput, memory, and
-KV-cache trade-offs on one NVIDIA GPU.
+KV-cache trade-offs on one NVIDIA GPU. Parameter-matched token-local controls and an
+explicit placement/amount sweep separate what fills a vacated attention slot from where
+and how much attention is replaced.
 
 The scientific question is deliberately narrow:
 
@@ -15,14 +17,21 @@ The scientific question is deliberately narrow:
 > how much language-modeling quality is retained, and what training/inference
 > efficiency is gained?
 
+The secondary controls extend it with one follow-on question:
+
+> How much of that answer is set by where and how much attention is replaced,
+> rather than by the exact token-local formulation filling the slot?
+
 TriGLU originated as an ablation in which cross-token mixing was removed from a richer
 experimental mixer. The token-local remainder retained enough empirical promise to merit
 an independent test. The richer mixer is not included here: this repository isolates the
 remaining equation and asks what it contributes under controlled conditions.
 
-Within each fixed-seed comparison, the experiments vary only the explicit
+Within each fixed-seed primary comparison, the experiments vary only the explicit
 attention/TriGLU layer plan. Comparisons between the 12-layer and 20-layer suites are not
-controlled ablations because their depth, context, and training budget differ.
+controlled ablations because their depth, context, and training budget differ. Three
+secondary controls compare TriGLU's positional branch, triple-branch fusion, and third
+multiplicative factor against the closest alternatives identified in the prior-art review.
 
 ## Repository scope and evidence
 
@@ -43,6 +52,7 @@ requirements are defined in [`docs/results-schema.md`](docs/results-schema.md).
   [equation tests](tests/test_triglu.py).
 - **Reviewers:** read the [experimental design](docs/design.md), the explicit configs under
   `configs/`, the [reproduced results](docs/results.md), and the
+  [related-work comparison](docs/related-work.md), then the
   [results/provenance protocol](docs/results-schema.md).
 - **Reproducers:** follow [Install and verify](#install-and-verify), prepare the pinned data,
   and run only the experiment suite relevant to the intended comparison.
@@ -108,6 +118,11 @@ implementation is
 [`TriGLU`](src/triglu/layers.py), and direct equation tests are in
 [`tests/test_triglu.py`](tests/test_triglu.py).
 
+TriGLU's full equation is narrower than the general ideas of multiplicative gating,
+polynomial feature products, or token-local attention replacement. The closest publicly
+documented component and experiment precedents, and the claims they rule out, are
+documented in [`docs/related-work.md`](docs/related-work.md).
+
 ### Component contract
 
 `TriGLU` is the mixer only: it does not contain normalization, a residual connection, or
@@ -140,7 +155,7 @@ separate experiments.
 
 ## Controlled decoder architecture
 
-Both mixer choices use the same conventional pre-norm wrapper:
+Both primary mixer choices use the same conventional pre-norm wrapper:
 
 ```text
 h     = x + mixer(RMSNorm(x))
@@ -166,9 +181,11 @@ attention does not simultaneously change normalization, residual flow, or FFN pl
 See [`docs/design.md`](docs/design.md) for the experimental controls and explicit layer
 placements.
 
-No GQA/MQA, sliding attention, additional experimental temporal mixer, alternative
-gate/FFN family, custom positional encoding or normalization, convolution, state-space
-layer, MoE, shared-weight bank, or proprietary architecture component is included.
+The primary ratio and placement suites add no GQA/MQA, sliding attention, experimental
+temporal mixer, alternative gate/FFN family, custom positional encoding or normalization,
+convolution, state-space layer, MoE, shared-weight bank, or proprietary architecture
+component. The three explicitly labeled prior-art controls are secondary experiments and
+do not alter the authoritative `TriGLU` class.
 
 ## Install and verify
 
@@ -409,6 +426,123 @@ deviation. Per-run baseline deltas always use the `20a0t` run with the matching 
 Because seed 1337 was used to select the focused architectures, treat it as exploratory;
 use seeds 2357 and 7331 as the confirmatory subset and report the pooled summary only as a
 secondary descriptive view.
+
+### Prior-art differentiation controls
+
+These secondary experiments hold the selected `15a5t_front_blend` replacement positions
+fixed at zero-based layers `{8, 12, 15, 17, 19}`. Data order, optimizer, token budget,
+evaluation cadence, wrapper, retained attention layers, and seed all remain matched.
+Only the token-local replacement equation changes:
+
+| Config | Replacement equation | Question tested | Parameters |
+| --- | --- | --- | ---: |
+| `15a5t_front_blend.yaml` | `W_o[RoPE(k) * SiLU(g) * v]` | TriGLU reference | 89,018,880 |
+| `15a5_triglu_no_rope_front_blend.yaml` | `W_o[k * SiLU(g) * v]` | Does one-branch RoPE matter? | 89,018,880 |
+| `15a5_mb_mlp_front_blend.yaml` | `W_o[GELU(k * g) * v]` | Does the published MB-MLP-style fusion explain the result? | 89,018,880 |
+| `15a5_swiglu_front_blend.yaml` | `W_o[SiLU(g) * v]` | Is a two-factor GLU sufficient? | 89,021,440 |
+
+The SwiGLU control uses an explicit hidden width of 683. Its five mixers add only 2,560
+parameters to the 89M model, but 683 is not a hardware-friendly width. Treat its quality
+as the primary comparison and its throughput as implementation-specific rather than a
+general SwiGLU efficiency result. The MB-MLP control adapts the published fusion equation
+to the same-width decoder slot by retaining this harness's output projection.
+
+Verify all three new code paths together with a two-step CPU smoke run:
+
+```bash
+python -m triglu.train \
+  --config configs/smoke_ablations.yaml \
+  --output-dir runs/smoke_ablations
+```
+
+Run the exploratory seed first if desired:
+
+```bash
+ABLATION_SEEDS=1337 bash scripts/run_prior_art_ablations.sh
+```
+
+Run the complete matched set at seeds 1337, 2357, and 7331 with:
+
+```bash
+bash scripts/run_prior_art_ablations.sh
+```
+
+The launcher runs only the three new controls. It reuses the already completed
+all-attention and TriGLU reference runs for matched comparisons, skips completed outputs,
+preflights every requested seed before launching, stops rather than overwriting an
+incomplete directory, and regenerates the suite report afterward. Outputs remain under
+`runs/20l_4k_1b/<plan>/`; configs are grouped under
+`configs/20l_4k_1b/ablations/`. Set `PYTHON_BIN` as for the replication launcher when
+needed.
+
+### Exploratory placement and amount sweep
+
+The configs under `configs/20l_4k_1b/placement_amount/` extend the no-RoPE control
+across replacement amount and placement at the same 20-layer geometry, data order, and
+one-billion-token budget. Five nested plans replace 2, 5, 8, 11, and 14 layers (each
+larger plan replaces a superset of the smaller plan's layers), and two further plans
+hold five replacements fixed while moving them into evenly repeating and contiguous
+tail placements. The exact zero-based layer lists are tabulated in
+[`docs/design.md`](docs/design.md). These are single-seed exploratory probes for
+locating trends across the placement/amount space; treat them like the screening
+sweep and report them separately from replicated findings.
+
+Do not add outcomes to `docs/results.md` until all intended seeds have completed and the
+report has been regenerated. The rationale and prior-work links are in
+[`docs/related-work.md`](docs/related-work.md).
+
+### Exploratory no-RoPE placement and amount sweep
+
+This post-hoc follow-up asks whether an attention-rich lower stack plus sparse later
+attention is a reusable placement strategy. It uses only no-RoPE TriGLU, seed 1337, and
+the same 20-layer/4K/one-billion-token settings as the completed suite. Because the
+equation and schedules were selected after inspecting earlier results, this is an
+exploratory screen—not an additional confirmatory experiment.
+
+The amount ladder is strictly nested: every row replaces a superset of the preceding
+row, so an earlier conversion never moves when the replacement count increases.
+
+| Config | Attention | No-RoPE TriGLU | Zero-based replacement layers |
+| --- | ---: | ---: | --- |
+| `18a2_triglu_no_rope_nested.yaml` | 18 | 2 | 15, 19 |
+| `15a5_triglu_no_rope_nested.yaml` | 15 | 5 | 7, 11, 15, 17, 19 |
+| `12a8_triglu_no_rope_nested.yaml` | 12 | 8 | 6, 7, 10, 11, 14, 15, 17, 19 |
+| `9a11_triglu_no_rope_nested.yaml` | 9 | 11 | 6, 7, 9–11, 13–15, 17–19 |
+| `6a14_triglu_no_rope_nested.yaml` | 6 | 14 | 6–19 |
+
+The final transition removes the attention refreshes at layers `{8, 12, 16}`. This
+provides an extreme prefix-only control, but a quality change cannot by itself establish
+that “refresh” is the causal mechanism.
+
+At five replacements, placement is examined separately:
+
+| Placement | Zero-based replacement layers | Source |
+| --- | --- | --- |
+| selected front blend | 8, 12, 15, 17, 19 | existing completed run |
+| nested ladder | 7, 11, 15, 17, 19 | new |
+| repeating | 3, 7, 11, 15, 19 | new |
+| tail block | 15–19 | new |
+
+The nested 15A/5T run appears in both analyses, while the selected front-blend run is
+reused, so the launcher starts seven new runs. On the recorded RTX PRO 6000 system,
+budget approximately nine to ten hours.
+
+Run this only after `scripts/run_prior_art_ablations.sh` has returned to the prompt:
+
+```bash
+bash scripts/run_no_rope_placement_sweep.sh
+```
+
+The launcher refuses to contend with any incomplete run in `runs/20l_4k_1b`, preflights
+every target directory before using the GPU, skips completed outputs, and regenerates the
+suite report. Configs are under `configs/20l_4k_1b/placement_amount/`; outputs remain flat
+under `runs/20l_4k_1b/<plan>/` so the existing reporter discovers them. As with the other
+launchers, `PYTHON_BIN=/path/to/python` selects an interpreter explicitly.
+
+Use the screening seed to identify a possible quality/efficiency knee. Replicate that
+plan and its immediate neighbors on matched seeds before presenting the schedule as a
+general result. A same-count spread supports placement sensitivity; the nested ladder
+tests one predeclared conversion path rather than exhaustively searching all layer masks.
 
 ## Evaluation
 

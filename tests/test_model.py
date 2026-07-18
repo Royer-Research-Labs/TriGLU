@@ -9,6 +9,8 @@ from torch import nn
 from triglu import (
     CausalSelfAttention,
     DecoderLM,
+    MBMLP,
+    SwiGLUMixer,
     TriGLU,
     ModelConfig,
 )
@@ -25,6 +27,7 @@ def tiny_config(layer_types: list[str] | None = None) -> ModelConfig:
         context_length=16,
         dropout=0.0,
         bias=False,
+        swiglu_mixer_hidden_size=21 if "swiglu_mixer" in layer_types else None,
         layer_types=layer_types,
     )
 
@@ -60,12 +63,25 @@ def test_model_uses_standard_rmsnorm_and_ties_embeddings() -> None:
 
 
 def test_explicit_layer_plan_selects_only_the_mixer() -> None:
-    config = tiny_config(["attention", "triglu"])
+    config = tiny_config(
+        [
+            "attention",
+            "triglu",
+            "triglu_no_rope",
+            "mb_mlp",
+            "swiglu_mixer",
+        ]
+    )
     model = DecoderLM(config)
     assert isinstance(model.blocks[0].mixer, CausalSelfAttention)
     assert isinstance(model.blocks[1].mixer, TriGLU)
-    assert type(model.blocks[0].norm_1) is type(model.blocks[1].norm_1)
-    assert type(model.blocks[0].ffn) is type(model.blocks[1].ffn)
+    assert isinstance(model.blocks[2].mixer, TriGLU)
+    assert model.blocks[2].mixer.rope is None
+    assert isinstance(model.blocks[3].mixer, MBMLP)
+    assert isinstance(model.blocks[4].mixer, SwiGLUMixer)
+    for block in model.blocks[1:]:
+        assert type(model.blocks[0].norm_1) is type(block.norm_1)
+        assert type(model.blocks[0].ffn) is type(block.ffn)
 
 
 def test_attention_and_triglu_plans_have_parameter_parity() -> None:
@@ -85,6 +101,22 @@ def test_attention_and_triglu_plans_start_from_identical_parameter_tensors() -> 
     assert attention_parameters.keys() == triglu_parameters.keys()
     for name, value in attention_parameters.items():
         torch.testing.assert_close(value, triglu_parameters[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layer_type", ["triglu_no_rope", "mb_mlp"])
+def test_exact_shape_controls_start_from_attention_parameter_tensors(
+    layer_type: str,
+) -> None:
+    torch.manual_seed(102)
+    attention_model = DecoderLM(tiny_config(["attention"]))
+    torch.manual_seed(102)
+    control_model = DecoderLM(tiny_config([layer_type]))
+
+    attention_parameters = dict(attention_model.named_parameters())
+    control_parameters = dict(control_model.named_parameters())
+    assert attention_parameters.keys() == control_parameters.keys()
+    for name, value in attention_parameters.items():
+        torch.testing.assert_close(value, control_parameters[name], rtol=0, atol=0)
 
 
 def test_model_is_causal() -> None:
@@ -117,6 +149,32 @@ def test_cached_tokenwise_logits_match_full_forward() -> None:
     assert caches is not None
     assert caches[0][0] is not None and caches[0][1] is not None
     assert caches[1] == (None, None, tokens.size(1))
+
+
+@pytest.mark.parametrize(
+    "layer_type",
+    ["triglu_no_rope", "mb_mlp", "swiglu_mixer"],
+)
+def test_ablation_model_cached_logits_match_full_forward(layer_type: str) -> None:
+    torch.manual_seed(123)
+    model = DecoderLM(tiny_config([layer_type])).eval()
+    tokens = torch.randint(0, model.config.vocab_size, (2, 8))
+    full = model(tokens).logits
+
+    caches = None
+    pieces: list[torch.Tensor] = []
+    for _position in range(tokens.size(1)):
+        position = len(pieces)
+        output = model(
+            tokens[:, position : position + 1],
+            caches=caches,
+            use_cache=True,
+        )
+        pieces.append(output.logits)
+        caches = output.caches
+
+    torch.testing.assert_close(full, torch.cat(pieces, dim=1), rtol=1e-4, atol=1e-5)
+    assert caches == ((None, None, tokens.size(1)),)
 
 
 def test_static_cached_logits_match_and_storage_stays_preallocated() -> None:
@@ -159,6 +217,30 @@ def test_static_cached_logits_match_and_storage_stays_preallocated() -> None:
             assert caches[1] == (None, None, token_position + 1)
 
     torch.testing.assert_close(full, torch.cat(pieces, dim=1), rtol=1e-4, atol=1e-5)
+
+
+def test_static_cache_allocates_kv_only_for_attention() -> None:
+    model = DecoderLM(
+        tiny_config(
+            [
+                "attention",
+                "triglu",
+                "triglu_no_rope",
+                "mb_mlp",
+                "swiglu_mixer",
+            ]
+        )
+    )
+    caches = model.allocate_static_cache(batch_size=2)
+
+    assert caches[0][0] is not None and caches[0][1] is not None
+    assert caches[0][2] == 0
+    assert caches[1:] == (
+        (None, None, 0),
+        (None, None, 0),
+        (None, None, 0),
+        (None, None, 0),
+    )
 
 
 def test_cached_multitoken_suffix_uses_absolute_causal_mask() -> None:
@@ -224,6 +306,14 @@ def test_residual_projection_initialization_is_depth_scaled() -> None:
     [
         ({"layer_types": ["attention"]}, "one entry per layer"),
         ({"layer_types": ["attention", "convolution"]}, "unsupported layer"),
+        (
+            {"layer_types": ["attention", "swiglu_mixer"]},
+            "swiglu_mixer_hidden_size",
+        ),
+        (
+            {"swiglu_mixer_hidden_size": 21},
+            "must be null",
+        ),
         ({"d_model": 15}, "divisible"),
         ({"tie_embeddings": False}, "must remain true"),
     ],

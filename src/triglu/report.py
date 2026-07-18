@@ -21,6 +21,12 @@ import yaml
 
 
 COLORS = ("#2563eb", "#dc2626", "#059669", "#7c3aed", "#ea580c", "#0891b2", "#4f46e5", "#be123c")
+TOKEN_LOCAL_LAYER_TYPES = (
+    "triglu",
+    "triglu_no_rope",
+    "mb_mlp",
+    "swiglu_mixer",
+)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -49,6 +55,24 @@ def _architecture_name(run_name: str) -> str:
     """Strip the replication suffix used by the bundled seed launcher."""
 
     return re.sub(r"_seed\d+$", "", run_name)
+
+
+def _replacement_counts(layer_types: Sequence[str]) -> dict[str, Any]:
+    counts = {
+        layer_type: layer_types.count(layer_type)
+        for layer_type in TOKEN_LOCAL_LAYER_TYPES
+    }
+    active = [
+        f"{layer_type}:{count}"
+        for layer_type, count in counts.items()
+        if count
+    ]
+    return {
+        "attention_layers": layer_types.count("attention"),
+        "token_local_layers": sum(counts.values()),
+        "replacement_mixers": ",".join(active) if active else "none",
+        **{f"{layer_type}_layers": count for layer_type, count in counts.items()},
+    }
 
 
 _REPORT_OUTPUT_NAMES = (
@@ -136,6 +160,7 @@ def _load_run(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         else config.get("data_provenance", {})
     )
     layer_types = list(model.get("layer_types", []))
+    replacement_counts = _replacement_counts(layer_types)
     evaluation = _last_evaluation(rows)
     complete = next((row for row in reversed(rows) if row.get("event") == "complete"), None)
     summary: dict[str, Any] = {
@@ -147,8 +172,7 @@ def _load_run(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "step": int((evaluation or complete or {}).get("step", 0)),
         "tokens_seen": int((evaluation or complete or {}).get("tokens_seen", 0)),
         "n_layers": int(model.get("n_layers", len(layer_types))),
-        "attention_layers": layer_types.count("attention"),
-        "triglu_layers": layer_types.count("triglu"),
+        **replacement_counts,
         "layer_types": layer_types,
         "parameter_count": runtime.get("parameter_count"),
         "context_length": model.get("context_length"),
@@ -224,7 +248,12 @@ def _aggregate_runs(runs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             "runs": len(members),
             "seeds": ",".join(str(run["seed"]) for run in sorted(members, key=lambda run: int(run["seed"]))),
             "attention_layers": members[0]["attention_layers"],
+            "token_local_layers": members[0]["token_local_layers"],
+            "replacement_mixers": members[0]["replacement_mixers"],
             "triglu_layers": members[0]["triglu_layers"],
+            "triglu_no_rope_layers": members[0]["triglu_no_rope_layers"],
+            "mb_mlp_layers": members[0]["mb_mlp_layers"],
+            "swiglu_mixer_layers": members[0]["swiglu_mixer_layers"],
         }
         for metric in metrics:
             values = [float(run[metric]) for run in members if run.get(metric) is not None]
@@ -537,11 +566,13 @@ def generate_report(*, runs_root: str | Path = "runs", results_root: str | Path 
         if external_eval:
             run["standalone_evaluation_loss"] = external_eval.get("loss")
 
-    summary_fields = ("plan", "architecture", "seed", "complete", "tokens_seen", "attention_layers", "triglu_layers", "parameter_count", "context_length", "validation_tokens", "validation_loss", "validation_perplexity", "validation_accuracy", "steady_train_tokens_per_second", "peak_training_memory_bytes", "device_name", "dtype", "torch_version", "data_manifest_sha256", "loss_delta_vs_baseline", "perplexity_ratio_vs_baseline", "throughput_ratio_vs_baseline", "prefill_tokens_per_second", "decode_tokens_per_second", "kv_cache_bytes_per_token")
+    summary_fields = ("plan", "architecture", "seed", "complete", "tokens_seen", "attention_layers", "token_local_layers", "replacement_mixers", "triglu_layers", "triglu_no_rope_layers", "mb_mlp_layers", "swiglu_mixer_layers", "parameter_count", "context_length", "validation_tokens", "validation_loss", "validation_perplexity", "validation_accuracy", "steady_train_tokens_per_second", "peak_training_memory_bytes", "device_name", "dtype", "torch_version", "data_manifest_sha256", "loss_delta_vs_baseline", "perplexity_ratio_vs_baseline", "throughput_ratio_vs_baseline", "prefill_tokens_per_second", "decode_tokens_per_second", "kv_cache_bytes_per_token")
     _write_csv(output / "summary.csv", runs, summary_fields)
     aggregates = _aggregate_runs(runs)
     aggregate_fields = (
-        "architecture", "runs", "seeds", "attention_layers", "triglu_layers",
+        "architecture", "runs", "seeds", "attention_layers", "token_local_layers",
+        "replacement_mixers", "triglu_layers", "triglu_no_rope_layers",
+        "mb_mlp_layers", "swiglu_mixer_layers",
         "validation_loss_mean", "validation_loss_std", "validation_perplexity_mean", "validation_perplexity_std",
         "validation_accuracy_mean", "validation_accuracy_std", "steady_train_tokens_per_second_mean", "steady_train_tokens_per_second_std",
         "matched_baseline_runs", "matched_baseline_seeds",
@@ -550,7 +581,7 @@ def generate_report(*, runs_root: str | Path = "runs", results_root: str | Path 
         "throughput_ratio_vs_baseline_mean", "throughput_ratio_vs_baseline_std",
     )
     _write_csv(output / "summary_by_architecture.csv", aggregates, aggregate_fields)
-    table_fields = (("architecture", "Architecture"), ("runs", "N"), ("seeds", "Seeds"), ("attention_layers", "Attention"), ("triglu_layers", "TriGLU"), ("validation_loss_mean", "Mean val loss"), ("validation_loss_std", "Loss SD"), ("loss_delta_vs_baseline_mean", "Matched Δ loss"), ("validation_perplexity_mean", "Mean PPL"), ("steady_train_tokens_per_second_mean", "Observed train tok/s"))
+    table_fields = (("architecture", "Architecture"), ("runs", "N"), ("seeds", "Seeds"), ("attention_layers", "Attention"), ("token_local_layers", "Token-local"), ("replacement_mixers", "Replacement mixer"), ("validation_loss_mean", "Mean val loss"), ("validation_loss_std", "Loss SD"), ("loss_delta_vs_baseline_mean", "Matched Δ loss"), ("validation_perplexity_mean", "Mean PPL"), ("steady_train_tokens_per_second_mean", "Observed train tok/s"))
     table = _markdown_table(sorted(aggregates, key=lambda row: float(row.get("validation_loss_mean") or math.inf)), table_fields)
     confirmatory_runs = [run for run in runs if int(run["seed"]) != 1337]
     confirmatory_aggregates = _aggregate_runs(confirmatory_runs) if confirmatory_runs else []

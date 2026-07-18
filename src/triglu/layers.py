@@ -20,6 +20,44 @@ LayerCache: TypeAlias = tuple[torch.Tensor | None, torch.Tensor | None, int]
 RMSNorm = nn.RMSNorm
 
 
+class _PositionOnlyMixer(nn.Module):
+    """Shared cache contract for token-local attention replacements."""
+
+    cache_name = "token-local mixer"
+
+    def _validate_cache(
+        self,
+        cache: LayerCache | None,
+        cache_position: int,
+    ) -> None:
+        if cache is None:
+            return
+        if len(cache) != 3:
+            raise ValueError(
+                f"a {self.cache_name} cache must be a (None, None, position) tuple"
+            )
+        cached_k, cached_v, cached_position = cache
+        if cached_k is not None or cached_v is not None:
+            raise ValueError(f"a {self.cache_name} cache stores no key/value tensors")
+        if cached_position != cache_position:
+            raise ValueError(
+                f"{self.cache_name} cache position mismatch: "
+                f"cache has {cached_position}, forward requested {cache_position}"
+            )
+
+    @staticmethod
+    def _next_cache(
+        sequence_length: int,
+        cache_position: int,
+        use_cache: bool,
+    ) -> LayerCache | None:
+        return (
+            (None, None, cache_position + sequence_length)
+            if use_cache
+            else None
+        )
+
+
 class SwiGLU(nn.Module):
     """Conventional SwiGLU feed-forward network."""
 
@@ -39,13 +77,15 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class TriGLU(nn.Module):
+class TriGLU(_PositionOnlyMixer):
     """The authoritative token-local Triple-Product Gated Linear Unit.
 
     TriGLU extends the two-factor SwiGLU form with a third projected factor:
     ``RoPE(K) * SiLU(G) * V``. It performs no cross-token reduction or
     aggregation. RoPE changes each token independently and is applied to K only.
     """
+
+    cache_name = "TriGLU"
 
     def __init__(self, config: ModelConfig, rope: RopeModule | None):
         super().__init__()
@@ -63,17 +103,7 @@ class TriGLU(nn.Module):
         cache_position: int = 0,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, LayerCache | None]:
-        if cache is not None:
-            if len(cache) != 3:
-                raise ValueError("a TriGLU cache must be a (None, None, position) tuple")
-            cached_k, cached_v, cached_position = cache
-            if cached_k is not None or cached_v is not None:
-                raise ValueError("a TriGLU cache stores no key/value tensors")
-            if cached_position != cache_position:
-                raise ValueError(
-                    "TriGLU cache position mismatch: "
-                    f"cache has {cached_position}, forward requested {cache_position}"
-                )
+        self._validate_cache(cache, cache_position)
 
         # K, G, V = split(W_kgv x), with three full-width C streams.
         k, g, v = self.c_proj(x).chunk(3, dim=-1)
@@ -89,10 +119,84 @@ class TriGLU(nn.Module):
         y = self.proj_out(y)
 
         # TriGLU stores no K/V history, only the next absolute position.
-        triglu_cache = (
-            (None, None, cache_position + k.size(1)) if use_cache else None
-        )
+        triglu_cache = self._next_cache(k.size(1), cache_position, use_cache)
         return y, triglu_cache
+
+
+class MBMLP(_PositionOnlyMixer):
+    """Same-width MB-MLP-style prior-art control.
+
+    The three full-width branches use the published fusion layout
+    ``GELU(K ⊙ G) ⊙ V``. The same-width output projection adapts that layout to
+    this repository's parameter-matched attention slot.
+    """
+
+    cache_name = "MB-MLP"
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        C = config.d_model
+        self.c_proj = nn.Linear(C, 3 * C, bias=config.bias)
+        self.proj_out = nn.Linear(C, C, bias=config.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: LayerCache | None = None,
+        cache_position: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, LayerCache | None]:
+        self._validate_cache(cache, cache_position)
+
+        # K, G, V = split(W_kgv x).
+        k, g, v = self.c_proj(x).chunk(3, dim=-1)
+
+        # y = W_o(GELU(K ⊙ G) ⊙ V).
+        y = self.proj_out(F.gelu(k * g) * v)
+
+        next_cache = self._next_cache(x.size(1), cache_position, use_cache)
+        return y, next_cache
+
+
+class SwiGLUMixer(_PositionOnlyMixer):
+    """Two-factor SwiGLU used directly in the attention slot.
+
+    Its hidden width is set explicitly in the experiment config. At width 512,
+    a hidden size of 683 makes the projection budget differ from attention and
+    TriGLU by only 512 weights per replaced layer.
+    """
+
+    cache_name = "SwiGLU mixer"
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        hidden_size = config.swiglu_mixer_hidden_size
+        if hidden_size is None:
+            raise ValueError(
+                "swiglu_mixer_hidden_size is required for a SwiGLU mixer"
+            )
+        C = config.d_model
+        self.hidden_size = hidden_size
+        self.c_proj = nn.Linear(C, 2 * hidden_size, bias=config.bias)
+        self.proj_out = nn.Linear(hidden_size, C, bias=config.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: LayerCache | None = None,
+        cache_position: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, LayerCache | None]:
+        self._validate_cache(cache, cache_position)
+
+        # G, V = split(W_gv x).
+        g, v = self.c_proj(x).chunk(2, dim=-1)
+
+        # y = W_o(SiLU(G) ⊙ V).
+        y = self.proj_out(F.silu(g) * v)
+
+        next_cache = self._next_cache(x.size(1), cache_position, use_cache)
+        return y, next_cache
 
 
 class CausalSelfAttention(nn.Module):
@@ -238,7 +342,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Shared two-sublayer pre-norm wrapper for either mixer choice.
+    """Shared two-sublayer pre-norm wrapper for every mixer choice.
 
     Keeping this wrapper identical is essential: the layer plan changes only
     the attention-replacement component, not normalization or residual topology.
@@ -254,6 +358,12 @@ class DecoderBlock(nn.Module):
         elif layer_type == "triglu":
             triglu_rope = RopeModule(config.d_model, theta=config.rope_theta)
             self.mixer = TriGLU(config, triglu_rope)
+        elif layer_type == "triglu_no_rope":
+            self.mixer = TriGLU(config, rope=None)
+        elif layer_type == "mb_mlp":
+            self.mixer = MBMLP(config)
+        elif layer_type == "swiglu_mixer":
+            self.mixer = SwiGLUMixer(config)
         else:
             raise ValueError(f"unsupported layer type {layer_type!r}")
         self.ffn = SwiGLU(config)

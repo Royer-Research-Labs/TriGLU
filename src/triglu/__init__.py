@@ -5,9 +5,11 @@ from .layers import (
     CausalSelfAttention,
     DecoderBlock,
     LayerCache,
+    MBMLP,
     TriGLU,
     RMSNorm,
     SwiGLU,
+    SwiGLUMixer,
 )
 from .model import DecoderLM, TriGLULM, LMOutput
 from .rope import RopeModule, RotaryEmbedding
@@ -17,6 +19,7 @@ __all__ = [
     "DecoderBlock",
     "DecoderLM",
     "LayerCache",
+    "MBMLP",
     "TriGLULM",
     "TriGLU",
     "LMOutput",
@@ -25,4 +28,5 @@ __all__ = [
     "RopeModule",
     "RotaryEmbedding",
     "SwiGLU",
+    "SwiGLUMixer",
 ]

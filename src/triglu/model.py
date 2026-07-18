@@ -1,4 +1,4 @@
-"""Decoder-only causal language model for TriGLU ablations."""
+"""Decoder-only causal language model for controlled attention-slot ablations."""
 
 from __future__ import annotations
 
@@ -212,7 +212,7 @@ class DecoderLM(nn.Module):
         """Preallocate fixed-capacity inference caches for every model layer.
 
         Attention layers receive ``[B, H, context, head_dim]`` K/V storage.
-        TriGLU layers retain their authoritative position-only cache tuple.
+        Token-local replacement layers retain a position-only cache tuple.
         Pass the result back through ``caches=`` with ``use_cache=True`` under
         ``torch.no_grad()`` or ``torch.inference_mode()``.
         """
@@ -227,7 +227,7 @@ class DecoderLM(nn.Module):
 
         caches: list[LayerCache] = []
         for block in self.blocks:
-            if block.layer_type == "triglu":
+            if block.layer_type != "attention":
                 caches.append((None, None, 0))
                 continue
             shape = (

@@ -10,11 +10,17 @@ wrapper used to evaluate it. That distinction is important for both audiences:
 
 ## Scientific variable
 
-Within a fixed-seed comparison in an experiment suite, every plan uses the same decoder
-width, depth, feed-forward network, normalization, residual topology, tokenizer, sampled
-token sequence, optimizer, schedule, and token budget. The only architecture variable is
-the explicit per-layer choice between causal attention and `TriGLU`. Focused replications
+Within a fixed-seed primary comparison, every plan uses the same decoder width, depth,
+feed-forward network, normalization, residual topology, tokenizer, sampled token
+sequence, optimizer, schedule, and token budget. The only architecture variable is the
+explicit per-layer choice between causal attention and `TriGLU`. Focused replications
 change the seed for every compared architecture together and report matched-seed deltas.
+
+Three secondary controls hold the selected layer positions fixed and change only the
+token-local replacement formulation: TriGLU without RoPE, an MB-MLP-style triple-branch
+product, and a near-parameter-matched two-factor SwiGLU. They test which part of the
+TriGLU formulation matters; they are not part of the primary replacement-ratio or
+placement ablations.
 
 The resolved configuration records the complete layer list. Ratios are labels, not a
 hidden placement algorithm.
@@ -57,7 +63,7 @@ the controlled architecture evaluated here without a separate ablation.
 
 ## Evaluated decoder wrapper
 
-The research harness places either mixer in the same conventional pre-norm
+The research harness places every attention-slot component in the same conventional pre-norm
 decoder wrapper:
 
 ```text
@@ -66,8 +72,8 @@ x_out   = h + SwiGLU(RMSNorm(h))
 ```
 
 Attention uses standard multi-head causal scaled-dot-product attention and per-head
-RoPE. TriGLU uses the authoritative equation above. Both mixer choices have the
-same projection parameter count (`4*C*C`, plus `4*C` when bias is enabled).
+RoPE. TriGLU uses the authoritative equation above. These two primary mixer choices have
+the same projection parameter count (`4*C*C`, plus `4*C` when bias is enabled).
 
 Using the same wrapper is an experimental control, not a requirement of the TriGLU
 equation. A fused form such as `x + MLP(mixer(norm(x)))` changes normalization, residual
@@ -87,9 +93,11 @@ shows the mixer and evaluated wrapper as separate functions.
 - GPT-style depth scaling on residual output projections;
 - no dropout by default.
 
-No learned positional mode, convolution, recurrence, state-space layer, additional
-temporal mixer beyond standard attention, custom normalization, custom FFN family, MoE,
-shared parameter bank, or other experimental component is implemented.
+The primary suites add no learned positional mode, convolution, recurrence, state-space
+layer, temporal mixer beyond standard attention, custom normalization, custom FFN
+family, MoE, or shared parameter bank. The secondary controls described below add only
+the explicitly named attention-slot equations; the surrounding decoder FFN remains the
+same conventional SwiGLU in every run.
 
 ## Layer placement: 12-layer suite
 
@@ -129,11 +137,102 @@ The last four rows hold the 15-attention/5-TriGLU ratio fixed and test placement
 particular, `15a5t_final_attention` differs from `15a5t_front_blend` only by swapping the
 types of layers 18 and 19.
 
+## Prior-art differentiation controls
+
+The secondary controls use the same 20-layer model and the
+`15a5t_front_blend` replacement positions `{8, 12, 15, 17, 19}`. Retained attention
+layers, wrapper, data order, optimizer, schedule, and one-billion-token budget stay
+fixed. The four comparison formulations are:
+
+| Config | Token-local replacement | Model parameters |
+| --- | --- | ---: |
+| `15a5t_front_blend.yaml` | `W_o[RoPE(k) * SiLU(g) * v]` | 89,018,880 |
+| `15a5_triglu_no_rope_front_blend.yaml` | `W_o[k * SiLU(g) * v]` | 89,018,880 |
+| `15a5_mb_mlp_front_blend.yaml` | `W_o[GELU(k * g) * v]` | 89,018,880 |
+| `15a5_swiglu_front_blend.yaml` | `W_o[SiLU(g) * v]` | 89,021,440 |
+
+The no-RoPE control is the authoritative `TriGLU` module with its optional rotation
+disabled, so it isolates position dependence without changing learned parameters. The
+MB-MLP control retains the same-width `C → 3C → C` projection budget but changes both
+activation placement and positional treatment; it is a published-equation control, not
+a one-variable activation test.
+
+The SwiGLU attention-slot control uses hidden width 683 because
+`3 * 512 * 683 = 1,049,088`, only 512 projection weights more per replaced layer than
+`4 * 512^2 = 1,048,576`. All parameters are active. Its quality is therefore
+near-parameter-matched, while throughput should be interpreted cautiously because 683
+is not a hardware-friendly width.
+
+Implementation and interpretation links for the closest published precedents are in
+[`docs/related-work.md`](related-work.md). These controls do not change the
+authoritative TriGLU equation or the conclusions supported by the already completed
+primary suite.
+
+## Exploratory placement/amount sweep (no-RoPE variant)
+
+The single-seed sweep under `configs/20l_4k_1b/placement_amount/` varies replacement
+amount and placement with the no-RoPE control while holding the 20-layer geometry,
+data order, optimizer, schedule, and token budget fixed. The five nested plans are
+strictly nested: each larger plan replaces a superset of the smaller plan's layers.
+
+| Config | Attention | Replaced | Zero-based no-RoPE layers |
+| --- | ---: | ---: | --- |
+| `18a2_triglu_no_rope_nested.yaml` | 18 | 2 | 15, 19 |
+| `15a5_triglu_no_rope_nested.yaml` | 15 | 5 | 7, 11, 15, 17, 19 |
+| `12a8_triglu_no_rope_nested.yaml` | 12 | 8 | 6, 7, 10, 11, 14, 15, 17, 19 |
+| `9a11_triglu_no_rope_nested.yaml` | 9 | 11 | 6, 7, 9–11, 13–15, 17–19 |
+| `6a14_triglu_no_rope_nested.yaml` | 6 | 14 | 6–19 |
+| `15a5_triglu_no_rope_repeating.yaml` | 15 | 5 | 3, 7, 11, 15, 19 |
+| `15a5_triglu_no_rope_tail_block.yaml` | 15 | 5 | 15, 16, 17, 18, 19 |
+
+These plans are exploratory single-seed probes, subject to the same screening-seed
+caveats as the original sweep: they locate trends and select candidates for focused
+replication; they do not by themselves support confirmatory claims.
+
+## Post-hoc no-RoPE placement and amount study
+
+The follow-up configs under `configs/20l_4k_1b/placement_amount/` use the no-RoPE
+formulation `W_o[k * SiLU(g) * v]` throughout. They retain the same seed-1337 data order,
+model dimensions, optimizer, schedule, wrapper, evaluation set, and one-billion-token
+budget. The study is explicitly exploratory because its component and masks were chosen
+after observing the primary and prior-art-control results.
+
+The staged amount ladder is:
+
+| Attention / token-local | No-RoPE TriGLU layers |
+| --- | --- |
+| 18 / 2 | `{15, 19}` |
+| 15 / 5 | `{7, 11, 15, 17, 19}` |
+| 12 / 8 | `{6, 7, 10, 11, 14, 15, 17, 19}` |
+| 9 / 11 | `{6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19}` |
+| 6 / 14 | `{6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}` |
+
+Each replacement set is a strict superset of the previous set. The last transition
+removes the only late attention layers—`{8, 12, 16}`—from the 9A/11T plan, leaving a
+six-attention prefix followed by fourteen token-local blocks.
+
+The fixed 15A/5T placement comparison uses four distinct masks:
+
+| Placement | No-RoPE TriGLU layers |
+| --- | --- |
+| selected front blend | `{8, 12, 15, 17, 19}` |
+| nested-ladder rung | `{7, 11, 15, 17, 19}` |
+| repeating | `{3, 7, 11, 15, 19}` |
+| tail block | `{15, 16, 17, 18, 19}` |
+
+Nestedness makes marginal changes along this one removal path readable, but replacement
+count still changes together with the identities of the newly converted layers. The
+same-count comparison is the direct placement control. A late loss increase would locate
+a candidate knee; it would not prove that periodic attention refresh is the cause.
+Follow-up replication should be limited to the knee and its immediate neighboring plans
+rather than treating every post-hoc screen as independent confirmation.
+
 ## Interpretation boundary
 
-TriGLU cannot transmit information between positions. Every hybrid therefore relies on
-retained attention layers for cross-token communication. An all-TriGLU stack is useful as
-a diagnostic negative control, not as a general language-model architecture.
+TriGLU and all three secondary controls are token local: none can transmit information
+between positions. Every hybrid therefore relies on retained attention layers for
+cross-token communication. An all-token-local stack is useful as a diagnostic negative
+control, not as a general language-model architecture.
 
 Effective-rank measurements describe the geometry of sampled activations; zero-update
 interventions describe dependence on a trained component under an out-of-distribution
