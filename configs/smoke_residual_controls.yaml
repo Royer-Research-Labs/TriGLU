@@ -1,12 +1,16 @@
 model:
   vocab_size: 256
-  n_layers: 4
+  n_layers: 3
   d_model: 64
   n_heads: 1
-  # 4 * 64 * 132 exactly matches the projection-weight budget of the
-  # conventional bias-free SwiGLU control at width 176: 3 * 64 * 176.
-  ffn_hidden_size: 132
-  ffn_type: triglu_no_rope
+  ffn_hidden_size: 176
+  ffn_type: swiglu
+  # Exercises uniform, FFN-only, and grouped-width construction in one tiny run.
+  ffn_hidden_sizes:
+    - 176
+    - 261
+    - 400
+  residual_init_depth: 4
   context_length: 16
   dropout: 0.0
   bias: false
@@ -14,13 +18,9 @@ model:
   norm_eps: 1.0e-5
   init_std: 0.02
   tie_embeddings: true
-  # Nearest integer to 4 * d_model / 3 for an active, near-matched two-factor
-  # attention-slot projection budget at this tiny smoke-test width.
-  swiglu_mixer_hidden_size: 85
   layer_types:
-    - triglu_no_rope
-    - mb_mlp
-    - swiglu_mixer
+    - attention
+    - ffn_only
     - attention
 
 data:
@@ -32,7 +32,7 @@ data:
   seed: 1234
 
 training:
-  output_dir: runs/smoke_ablations
+  output_dir: runs/smoke_residual_controls
   device: cpu
   dtype: float32
   compile: false

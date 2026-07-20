@@ -304,6 +304,18 @@ class _LayerDiagnostics:
         self.handles: list[Any] = []
 
     def install(self) -> None:
+        # The stage hooks are defined against the sequential two-norm block
+        # (mixer norm / post-mixer residual / FFN norm are distinct points).
+        # A single-norm parallel block has no such stages; reject it loudly
+        # instead of crashing on the absent second norm.
+        if getattr(self.model.config, "block_mode", "sequential") != "sequential":
+            raise ConfigurationError(
+                "rank analysis requires the sequential two-norm decoder block; "
+                f"this checkpoint uses block_mode="
+                f"{self.model.config.block_mode!r}, whose merged block has no "
+                "separable mixer/FFN stages"
+            )
+
         def embedding_hook(_module: Any, _inputs: Any, output: torch.Tensor) -> None:
             self.hidden[0].update(output, self.maximum_rank_rows)
 
@@ -370,8 +382,12 @@ class _LayerDiagnostics:
                 layer_index: int = index,
             ) -> None:
                 self.ffn_updates[layer_index].update(output, self.maximum_rank_rows)
+                residual = self.pending_post_mixer.get(
+                    layer_index,
+                    self.pending_residuals[layer_index],
+                )
                 self.ffn_residual_updates[layer_index].update(
-                    self.pending_post_mixer[layer_index],
+                    residual,
                     output,
                     self.maximum_rank_rows,
                 )
@@ -390,10 +406,15 @@ class _LayerDiagnostics:
                 self.pending_post_mixer.pop(layer_index, None)
 
             self.handles.append(block.register_forward_pre_hook(block_pre_hook))
-            self.handles.append(block.norm_1.register_forward_hook(mixer_input_hook))
-            self.handles.append(block.mixer.register_forward_hook(mixer_hook))
-            # norm_2 receives the residual immediately after the mixer addition.
-            self.handles.append(block.norm_2.register_forward_pre_hook(post_mixer_hook))
+            if block.layer_type != "ffn_only":
+                self.handles.append(
+                    block.norm_1.register_forward_hook(mixer_input_hook)
+                )
+                self.handles.append(block.mixer.register_forward_hook(mixer_hook))
+                # norm_2 receives the residual immediately after the mixer addition.
+                self.handles.append(
+                    block.norm_2.register_forward_pre_hook(post_mixer_hook)
+                )
             self.handles.append(block.norm_2.register_forward_hook(ffn_input_hook))
             self.handles.append(block.ffn.register_forward_hook(ffn_hook))
             self.handles.append(block.register_forward_hook(block_hook))
@@ -461,6 +482,7 @@ class _LayerDiagnostics:
                 **metrics,
             }
             for index, metrics in enumerate(update_metrics)
+            if layer_types[index] != "ffn_only"
         ]
         residual_updates = [
             {
@@ -469,6 +491,7 @@ class _LayerDiagnostics:
                 **accumulator.finalize(),
             }
             for index, accumulator in enumerate(self.residual_updates)
+            if layer_types[index] != "ffn_only"
         ]
         ffn_residual_updates = [
             {
@@ -480,15 +503,35 @@ class _LayerDiagnostics:
         ]
         layer_stages: list[dict[str, Any]] = []
         for index in range(self.model.config.n_layers):
-            stage_accumulators = (
-                ("block_input", hidden_metrics[index]),
-                ("mixer_norm_input", self.mixer_inputs[index].finalize(self.rank_tolerance)),
-                ("mixer_update", update_metrics[index]),
-                ("post_mixer_residual", self.post_mixer[index].finalize(self.rank_tolerance)),
-                ("ffn_norm_input", self.ffn_inputs[index].finalize(self.rank_tolerance)),
-                ("ffn_update", ffn_update_metrics[index]),
-                ("block_output", hidden_metrics[index + 1]),
-            )
+            if layer_types[index] == "ffn_only":
+                stage_accumulators = (
+                    ("block_input", hidden_metrics[index]),
+                    (
+                        "ffn_norm_input",
+                        self.ffn_inputs[index].finalize(self.rank_tolerance),
+                    ),
+                    ("ffn_update", ffn_update_metrics[index]),
+                    ("block_output", hidden_metrics[index + 1]),
+                )
+            else:
+                stage_accumulators = (
+                    ("block_input", hidden_metrics[index]),
+                    (
+                        "mixer_norm_input",
+                        self.mixer_inputs[index].finalize(self.rank_tolerance),
+                    ),
+                    ("mixer_update", update_metrics[index]),
+                    (
+                        "post_mixer_residual",
+                        self.post_mixer[index].finalize(self.rank_tolerance),
+                    ),
+                    (
+                        "ffn_norm_input",
+                        self.ffn_inputs[index].finalize(self.rank_tolerance),
+                    ),
+                    ("ffn_update", ffn_update_metrics[index]),
+                    ("block_output", hidden_metrics[index + 1]),
+                )
             layer_stages.extend(
                 {
                     "layer": index,
@@ -507,8 +550,25 @@ class _LayerDiagnostics:
                 if item["layer"] == index
             }
             input_rank = stages["block_input"]["entropy_effective_rank"]
-            post_mixer_rank = stages["post_mixer_residual"]["entropy_effective_rank"]
             output_rank = stages["block_output"]["entropy_effective_rank"]
+            if layer_types[index] == "ffn_only":
+                post_mixer_rank = None
+                mixer_rank_delta = None
+                ffn_rank_delta = output_rank - input_rank
+                mixer_rank_ratio = None
+                ffn_rank_ratio = output_rank / input_rank if input_rank else 0.0
+            else:
+                post_mixer_rank = stages["post_mixer_residual"][
+                    "entropy_effective_rank"
+                ]
+                mixer_rank_delta = post_mixer_rank - input_rank
+                ffn_rank_delta = output_rank - post_mixer_rank
+                mixer_rank_ratio = (
+                    post_mixer_rank / input_rank if input_rank else 0.0
+                )
+                ffn_rank_ratio = (
+                    output_rank / post_mixer_rank if post_mixer_rank else 0.0
+                )
             stage_transitions.append(
                 {
                     "layer": index,
@@ -516,11 +576,11 @@ class _LayerDiagnostics:
                     "block_input_entropy_effective_rank": input_rank,
                     "post_mixer_entropy_effective_rank": post_mixer_rank,
                     "block_output_entropy_effective_rank": output_rank,
-                    "mixer_rank_delta": post_mixer_rank - input_rank,
-                    "ffn_rank_delta": output_rank - post_mixer_rank,
+                    "mixer_rank_delta": mixer_rank_delta,
+                    "ffn_rank_delta": ffn_rank_delta,
                     "block_rank_delta": output_rank - input_rank,
-                    "mixer_rank_ratio": post_mixer_rank / input_rank if input_rank else 0.0,
-                    "ffn_rank_ratio": output_rank / post_mixer_rank if post_mixer_rank else 0.0,
+                    "mixer_rank_ratio": mixer_rank_ratio,
+                    "ffn_rank_ratio": ffn_rank_ratio,
                 }
             )
         attention_heads = [
@@ -710,6 +770,8 @@ def run_rank_analysis(
         )
         mixer_ablations: list[dict[str, Any]] = []
         for index, block in enumerate(model.blocks):
+            if block.layer_type == "ffn_only":
+                continue
             with _bypass_residual_update(block.mixer):
                 metrics = evaluate_language_model(
                     model,
@@ -766,7 +828,7 @@ def run_rank_analysis(
 
     result: dict[str, Any] = {
         "event": "rank_analysis",
-        "schema_version": 2,
+        "schema_version": 3,
         "time": utc_now(),
         "checkpoint": str(checkpoint_path),
         "checkpoint_step": int(checkpoint.get("step", 0)),
@@ -777,6 +839,13 @@ def run_rank_analysis(
             "n_heads": model_config.n_heads,
             "context_length": model_config.context_length,
             "layer_types": list(model_config.layer_types),
+            "ffn_type": model_config.ffn_type,
+            "ffn_hidden_size": model_config.ffn_hidden_size,
+            "ffn_hidden_sizes": model_config.effective_ffn_hidden_sizes,
+            "ffn_total_hidden_size": sum(
+                model_config.effective_ffn_hidden_sizes
+            ),
+            "residual_init_depth": model_config.effective_residual_init_depth,
         },
         "settings": {
             "device": str(runtime.device),
@@ -801,7 +870,7 @@ def run_rank_analysis(
             ),
             "layer_stages": (
                 "centered channel-covariance spectra before and after each residual "
-                "addition; mixer and FFN updates are reported separately"
+                "addition; mixer stages are omitted for FFN-only blocks"
             ),
         },
         "environment": environment_info(runtime),

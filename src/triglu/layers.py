@@ -61,20 +61,53 @@ class _PositionOnlyMixer(nn.Module):
 class SwiGLU(nn.Module):
     """Conventional SwiGLU feed-forward network."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        hidden_size: int | None = None,
+    ) -> None:
         super().__init__()
+        H = config.ffn_hidden_size if hidden_size is None else hidden_size
         self.gate_proj = nn.Linear(
-            config.d_model, config.ffn_hidden_size, bias=config.bias
+            config.d_model, H, bias=config.bias
         )
         self.up_proj = nn.Linear(
-            config.d_model, config.ffn_hidden_size, bias=config.bias
+            config.d_model, H, bias=config.bias
         )
         self.down_proj = nn.Linear(
-            config.ffn_hidden_size, config.d_model, bias=config.bias
+            H, config.d_model, bias=config.bias
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class TriGLUFFN(nn.Module):
+    """Cache-free no-RoPE TriGLU used in the model's FFN slot.
+
+    This control preserves the supplied triple-product equation while changing
+    only its projection width to match the conventional FFN parameter budget:
+    ``K, G, V = split(W_kgv x)`` and
+    ``y = W_down(K * SiLU(G) * V)``. It has no positional or cross-token
+    operation.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        hidden_size: int | None = None,
+    ) -> None:
+        super().__init__()
+        C = config.d_model
+        H = config.ffn_hidden_size if hidden_size is None else hidden_size
+        self.c_proj = nn.Linear(C, 3 * H, bias=config.bias)
+        self.down_proj = nn.Linear(H, C, bias=config.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # K, G, V = split(W_kgv x), with three H-wide streams.
+        k, g, v = self.c_proj(x).chunk(3, dim=-1)
+        # y = W_down(K ⊙ SiLU(G) ⊙ V).
+        return self.down_proj(k * F.silu(g) * v)
 
 
 class TriGLU(_PositionOnlyMixer):
@@ -341,18 +374,46 @@ class CausalSelfAttention(nn.Module):
         return y, next_cache
 
 
-class DecoderBlock(nn.Module):
-    """Shared two-sublayer pre-norm wrapper for every mixer choice.
+def _build_ffn(
+    config: ModelConfig,
+    hidden_size: int,
+) -> nn.Module:
+    if config.ffn_type == "swiglu":
+        return SwiGLU(config, hidden_size)
+    if config.ffn_type == "triglu_no_rope":
+        return TriGLUFFN(config, hidden_size)
+    # ModelConfig validates this before model construction.
+    raise ValueError(f"unsupported FFN type {config.ffn_type!r}")
 
-    Keeping this wrapper identical is essential: the layer plan changes only
-    the attention-replacement component, not normalization or residual topology.
+
+class DecoderBlock(nn.Module):
+    """Shared pre-norm wrapper for every controlled choice.
+
+    Mixer ablations change only the attention slot. The separate FFN-form
+    ablation changes only the second sublayer's function. ``block_mode``
+    selects between the canonical two-norm sequential wrapper and a labeled
+    single-norm parallel speed/quality control; normalization and residual
+    topology are otherwise identical.
     """
 
-    def __init__(self, config: ModelConfig, layer_type: str) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_type: str,
+        ffn_hidden_size: int | None = None,
+    ) -> None:
         super().__init__()
+        if layer_type == "ffn_only":
+            raise ValueError("ffn_only requires FFNOnlyBlock")
         self.layer_type = layer_type
+        # Validated by ModelConfig; "parallel" shares one norm across mixer/FFN.
+        self.block_mode = config.block_mode
         self.norm_1 = RMSNorm(config.d_model, eps=config.norm_eps)
-        self.norm_2 = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.norm_2 = (
+            RMSNorm(config.d_model, eps=config.norm_eps)
+            if self.block_mode == "sequential"
+            else None
+        )
         if layer_type == "attention":
             self.mixer: nn.Module = CausalSelfAttention(config)
         elif layer_type == "triglu":
@@ -366,7 +427,12 @@ class DecoderBlock(nn.Module):
             self.mixer = SwiGLUMixer(config)
         else:
             raise ValueError(f"unsupported layer type {layer_type!r}")
-        self.ffn = SwiGLU(config)
+        hidden_size = (
+            config.ffn_hidden_size
+            if ffn_hidden_size is None
+            else ffn_hidden_size
+        )
+        self.ffn = _build_ffn(config, hidden_size)
 
     def forward(
         self,
@@ -375,6 +441,17 @@ class DecoderBlock(nn.Module):
         cache_position: int = 0,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, LayerCache | None]:
+        if self.block_mode == "parallel":
+            # One shared norm feeds mixer and FFN; both write into a single
+            # residual add: x + mixer(norm(x)) + ffn(norm(x)).
+            normed = self.norm_1(x)
+            mixed, next_cache = self.mixer(
+                normed,
+                cache=cache,
+                cache_position=cache_position,
+                use_cache=use_cache,
+            )
+            return x + mixed + self.ffn(normed), next_cache
         mixed, next_cache = self.mixer(
             self.norm_1(x),
             cache=cache,
@@ -383,4 +460,45 @@ class DecoderBlock(nn.Module):
         )
         x = x + mixed
         x = x + self.ffn(self.norm_2(x))
+        return x, next_cache
+
+
+class FFNOnlyBlock(_PositionOnlyMixer):
+    """Single-residual pre-norm FFN block used only as a topology control.
+
+    Unlike :class:`DecoderBlock`, this block has no attention/replacement mixer,
+    no first normalization, and no first residual update:
+    ``y = x + FFN(RMSNorm(x))``. It retains only the position component of the
+    unified cache contract and performs no cross-token operation.
+    """
+
+    cache_name = "FFN-only block"
+    layer_type = "ffn_only"
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        ffn_hidden_size: int | None = None,
+    ) -> None:
+        super().__init__()
+        hidden_size = (
+            config.ffn_hidden_size
+            if ffn_hidden_size is None
+            else ffn_hidden_size
+        )
+        # Keep the FFN-sublayer name used by ordinary DecoderBlock state dicts;
+        # norm_1 is intentionally absent because there is no mixer sublayer.
+        self.norm_2 = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.ffn = _build_ffn(config, hidden_size)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: LayerCache | None = None,
+        cache_position: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, LayerCache | None]:
+        self._validate_cache(cache, cache_position)
+        x = x + self.ffn(self.norm_2(x))
+        next_cache = self._next_cache(x.size(1), cache_position, use_cache)
         return x, next_cache

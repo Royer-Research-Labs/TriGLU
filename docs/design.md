@@ -22,27 +22,46 @@ product, and a near-parameter-matched two-factor SwiGLU. They test which part of
 TriGLU formulation matters; they are not part of the primary replacement-ratio or
 placement ablations.
 
+A separate all-attention FFN-form control leaves every mixer as causal attention and
+changes only the second sublayer from conventional SwiGLU to a no-RoPE triple-product
+FFN. It tests the form's competitiveness in the FFN role, not its ability to replace
+attention. It is outside both the primary attention-replacement comparisons and the
+attention-slot differentiation controls.
+
+A family of post-hoc residual-topology controls deliberately relaxes the fixed-wrapper
+rule: parameter-matched single-residual SwiGLU blocks at selected positions, two
+nine-block grouped-width collapses of the hybrid schedule, a conventional shallow
+capacity anchor, and single-norm parallel blocks. They test possible architectural
+explanations of the placement result and cannot be used as evidence about TriGLU versus
+another mixer.
+
 The resolved configuration records the complete layer list. Ratios are labels, not a
 hidden placement algorithm.
 
 ## Authoritative TriGLU equation
 
 TriGLU means **Triple-Product Gated Linear Unit**. For an input token `x_t` with width
-`C`, it computes
+`C`, the recommended form computes
 
 ```text
 (k_t, g_t, v_t) = split_3(W_c x_t + b_c)
-k_t              = RoPE(k_t, position=t)
 z_t              = k_t * SiLU(g_t) * v_t
 y_t              = W_o z_t + b_o
 ```
 
 All products are elementwise. `W_c` is one fused `C -> 3C` projection and `W_o` is
-`C -> C`. RoPE rotates the full `C`-wide `k` vector and is not applied to `g` or `v`.
-No operation reads another token. This is therefore a position-dependent, token-local,
-channel-wise gated-product block—not linear attention and not an attention approximation.
-Relative to the two-factor `SiLU(g_t) * v_t` SwiGLU form, TriGLU adds the third
-projected factor `k_t`. “Tri” names the three multiplicative factors, not three gates.
+`C -> C`. No operation reads another token. This is therefore a token-local, channel-wise
+gated-product block—not linear attention and not an attention approximation. Relative to
+the two-factor `SiLU(g_t) * v_t` SwiGLU form, TriGLU adds the third projected factor `k_t`.
+“Tri” names the three multiplicative factors, not three gates, and is independent of RoPE.
+
+An **optional RoPE variant** inserts `k_t = RoPE(k_t, position=t)` before the product,
+rotating the full `C`-wide `k` vector only (position-dependent but still token-local). This
+was TriGLU's ablation origin and the v0.1.0 default; the controlled experiments in this
+repository found the no-RoPE form to be the better attention replacement, so the RoPE form
+is retained only as the origin and as the control that isolates the positional branch.
+In the layer plan the recommended form is `triglu_no_rope` and the origin variant is
+`triglu`; the historical layer-type names are kept so v0.1.0 configs remain valid.
 
 During cached decoding a TriGLU layer stores no keys or values. Its cache tuple contains
 only the next integer position: `(None, None, next_position)`.
@@ -74,6 +93,9 @@ x_out   = h + SwiGLU(RMSNorm(h))
 Attention uses standard multi-head causal scaled-dot-product attention and per-head
 RoPE. TriGLU uses the authoritative equation above. These two primary mixer choices have
 the same projection parameter count (`4*C*C`, plus `4*C` when bias is enabled).
+This wrapper defines the primary and attention-slot-control experiments. The
+all-attention FFN-form control below preserves the two-sublayer topology but substitutes
+the explicitly documented function in the second sublayer.
 
 Using the same wrapper is an experimental control, not a requirement of the TriGLU
 equation. A fused form such as `x + MLP(mixer(norm(x)))` changes normalization, residual
@@ -87,7 +109,8 @@ shows the mixer and evaluated wrapper as separate functions.
 - pre-norm `torch.nn.RMSNorm`;
 - ordinary multi-head attention (no GQA, MQA, or local windows);
 - PyTorch scaled-dot-product attention with causal masking;
-- per-head RoPE for attention and full-width RoPE for TriGLU;
+- per-head RoPE for attention; the recommended TriGLU form applies no rotation (the
+  full-width-RoPE TriGLU is an optional origin-variant control);
 - standard SwiGLU channel MLP;
 - tied input embeddings and language-model head;
 - GPT-style depth scaling on residual output projections;
@@ -96,8 +119,9 @@ shows the mixer and evaluated wrapper as separate functions.
 The primary suites add no learned positional mode, convolution, recurrence, state-space
 layer, temporal mixer beyond standard attention, custom normalization, custom FFN
 family, MoE, or shared parameter bank. The secondary controls described below add only
-the explicitly named attention-slot equations; the surrounding decoder FFN remains the
-same conventional SwiGLU in every run.
+the explicitly named attention-slot equations; their surrounding decoder FFN remains the
+same conventional SwiGLU. The separately labeled FFN-form control is documented in its
+own section because it changes that otherwise fixed sublayer.
 
 ## Layer placement: 12-layer suite
 
@@ -168,6 +192,206 @@ Implementation and interpretation links for the closest published precedents are
 authoritative TriGLU equation or the conclusions supported by the already completed
 primary suite.
 
+## All-attention FFN-form control
+
+The config
+[`20a0t_triglu_no_rope_ffn.yaml`](../configs/20l_4k_1b/ablations/20a0t_triglu_no_rope_ffn.yaml)
+keeps the baseline's 20 attention mixers and replaces every conventional SwiGLU FFN with
+a distinct `TriGLUFFN` module. For normalized FFN input `x`, the two forms are:
+
+```text
+SwiGLU:
+g = W_gate x
+v = W_up x
+y = W_down[SiLU(g) * v]
+
+TriGLU-form FFN:
+(k, g, v) = split_3(W_c x)
+y = W_down[k * SiLU(g) * v]
+```
+
+The TriGLU-form FFN deliberately omits RoPE and has no position argument, cross-token
+operation, or cache state. Its projection width is an FFN hidden width rather than the
+residual width used by the authoritative attention-slot `TriGLU` component. It is
+therefore an equation-form control in a different architectural role, not a modified
+definition of the public mixer.
+
+For residual width `C`, standard SwiGLU width `H`, and triple-product width `T`, the
+bias-free projection counts are `3*C*H` and `4*C*T`, respectively. The supplied control
+uses `C = 512`, `H = 1376`, and `T = 1032`:
+
+```text
+3 * 512 * 1376 = 2,113,536 weights per SwiGLU block
+4 * 512 * 1032 = 2,113,536 weights per TriGLU-form block
+```
+
+Because `bias: false` and every tensor outside the FFN is unchanged, the two complete
+all-attention models are exactly matched at 89,018,880 parameters. RMSNorm placement,
+residual flow, attention, initialization policy, embeddings, output head, data order,
+optimizer, schedule, and token budget remain fixed.
+
+This control cannot support an attention-replacement or KV-cache claim: every attention
+sublayer and its KV state remain present. Its scoped question is whether the
+triple-product equation is competitive with conventional SwiGLU as a decoder FFN.
+Conventional SwiGLU remains the default and the sole FFN in all primary and
+attention-slot-control experiments.
+
+Run the recorded seed directly with:
+
+```bash
+python -m triglu.train \
+  --config configs/20l_4k_1b/ablations/20a0t_triglu_no_rope_ffn.yaml
+```
+
+For three matched seeds and the guarded 4K/8K/16K benchmark cleanup, use
+`scripts/run_final_replications_and_benchmarks.sh` as documented in the repository
+README. The 8K and 16K measurements are efficiency extrapolations above the 4K training
+context; they do not measure language-model quality at those lengths.
+
+## Combined replacement and FFN-form control
+
+The attention-slot replacement and the FFN-form control each improve quality on their own.
+The config
+[`9a11_triglu_no_rope_nested_triglu_ffn.yaml`](../configs/20l_4k_1b/ablations/9a11_triglu_no_rope_nested_triglu_ffn.yaml)
+tests whether they compose: it uses the flagship 55% no-RoPE nested replacement placement
+*and* the no-RoPE triple-product FFN in every block, at FFN width 1032. Because
+`4 * 512 * 1032 = 3 * 512 * 1376`, the model has exactly the 9a11 hybrid's 89,018,880
+parameters, so the only change from the replacement-only flagship is the FFN equation.
+
+Its scoped question is whether the two independently measured wins add. It is an
+exploratory seed-1337 probe, interpreted against the same-seed replacement-only and
+FFN-only runs rather than the pooled means.
+
+## Residual-topology stress controls
+
+These controls are explicitly outside the primary controlled decoder wrapper.
+
+### Exactly matched single-residual block
+
+At front-blend positions `{8, 12, 15, 17, 19}`, the config
+[`15a5_wide_swiglu_single_residual_front_blend.yaml`](../configs/20l_4k_1b/ablations/15a5_wide_swiglu_single_residual_front_blend.yaml)
+replaces
+
+```text
+h = x + mixer(RMSNorm_1(x))
+y = h + SwiGLU_1376(RMSNorm_2(h))
+```
+
+with
+
+```text
+y = x + SwiGLU_2059(RMSNorm(x)).
+```
+
+The new `ffn_only` block has no mixer, no mixer normalization, and no mixer residual
+addition. It returns only position metadata under the model's unified cache API.
+For bias-free residual width `C = 512`, the whole-block parameter counts are exactly
+equal:
+
+```text
+ordinary block = 4*C^2 + 3*C*1376 + 2*C = 3,163,136
+FFN-only block =         3*C*2059 +   C = 3,163,136
+```
+
+The 20-block model therefore remains exactly 89,018,880 parameters. The experiment
+changes attention count, normalization count, residual depth, and the allocation of
+channel capacity together. Its scoped question is whether a single wider channel update
+can explain the retained capacity; a positive result would not identify which of those
+joint changes is causal. Parameter equality does not imply equal initial update RMS or
+runtime because the two residual paths have been consolidated into one wider FFN.
+
+### Nine-block grouped-width collapse
+
+The config
+[`9l_9a0t_grouped_swiglu_9a11_nested_collapse.yaml`](../configs/20l_4k_1b/ablations/9l_9a0t_grouped_swiglu_9a11_nested_collapse.yaml)
+starts from attention positions `{0, 1, 2, 3, 4, 5, 8, 12, 16}` in the nested
+9-attention/11-token-local plan. Each retained attention absorbs the complete parameter
+budget of the blocks following it up to the next retained attention:
+
+| New block | Source blocks | SwiGLU width |
+| ---: | --- | ---: |
+| 0–4 | `[0]`, `[1]`, `[2]`, `[3]`, `[4]` | 1376 each |
+| 5 | `[5, 6, 7]` | 5495 |
+| 6 | `[8, 9, 10, 11]` | 7554 |
+| 7 | `[12, 13, 14, 15]` | 7554 |
+| 8 | `[16, 17, 18, 19]` | 7554 |
+
+Width 7554 exactly matches four original blocks. The three-block group cannot be matched
+exactly at integer hidden width: 5495 is 512 parameters above, while 5494 would be 1,024
+below. The complete model is therefore 89,019,392 parameters, only 512 (+0.0006%) above
+the 89,018,880 reference.
+
+This model has nine attention sublayers, nine KV caches, nine FFNs, and 18 residual
+additions. It has no TriGLU or other attention-replacement block. The resolved config
+sets `residual_init_depth: 20`, so every surviving attention and FFN output projection
+retains the source model's `init_std / sqrt(2*20)` per-weight standard deviation rather
+than receiving the additional depth-based increase implied by nine physical blocks.
+This does not equalize the residual-update RMS of width-1376 and width-7554 FFNs; wider
+hidden activations can increase output variance even at the same down-projection weight
+standard deviation. That width-dependent update scale is an explicit limitation of this
+stress test and should be measured with the residual-update diagnostics.
+
+Both controls use the same data order, optimizer, schedule, 4K training context, and
+one-billion-token budget as their references. Seed 1337 is an exploratory screen.
+Quality claims require matched-seed replication; 8K and 16K measurements remain
+architecture-efficiency extrapolations.
+
+### Nine-layer FFN-form and shallow controls
+
+Two follow-on seed-1337 controls make the grouped-collapse result easier to interpret.
+The grouped no-RoPE TriGLU-FFN model retains the same nine attention blocks, source
+groups, 20-layer residual initialization, and training configuration as the grouped
+SwiGLU model. Its FFN widths are
+`[1032, 1032, 1032, 1032, 1032, 4121, 5666, 5666, 5665]`. Since a no-RoPE
+triple-product FFN has `4*C*H` projection weights while SwiGLU has `3*C*H`, this is
+the nearest integer-width match to the grouped SwiGLU projection budget. The complete
+models have 89,019,904 and 89,019,392 parameters respectively, a difference of 512
+(0.0006%). The comparison changes the FFN equation while holding the collapsed topology
+and initialization fixed; it does not test TriGLU in an attention slot.
+
+The uniform shallow control is a conventional nine-layer all-attention decoder with a
+width-1376 SwiGLU in every block, 18 residual additions, and normal nine-layer
+residual-projection initialization. It has 54,224,384 parameters. This control shows the
+quality and efficiency of simply training a much smaller ordinary decoder at the same
+token budget. It does not, by itself, isolate physical layer count: relative to the
+grouped-width controls, both FFN capacity allocation and residual initialization differ.
+The distinction is intentional and must remain visible in result tables through the
+width schedule, parameter count, and residual initialization depth.
+
+| Config | Physical blocks | FFN form and widths | Init depth | Parameters |
+| --- | ---: | --- | ---: | ---: |
+| `9l_9a0t_grouped_swiglu_9a11_nested_collapse` | 9 | SwiGLU, 1376–7554 | 20 | 89,019,392 |
+| `9l_9a0t_grouped_triglu_no_rope_ffn` | 9 | no-RoPE triple product, 1032–5666 | 20 | 89,019,904 |
+| `9l_9a0t_standard_swiglu` | 9 | SwiGLU, 1376 throughout | 9 | 54,224,384 |
+
+### Single-norm parallel block
+
+`block_mode: parallel` replaces the canonical two-norm sequential wrapper with a
+single-norm parallel block in which the mixer and FFN read one shared normalization of the
+block input and write into a single residual add:
+
+```text
+sequential (default):          parallel:
+  h = x + mixer(RMSNorm_1(x))     n = RMSNorm(x)
+  y = h + FFN(RMSNorm_2(h))       y = x + mixer(n) + FFN(n)
+```
+
+Two configs use it, both otherwise identical to their sequential references:
+[`20a0t_parallel_block.yaml`](../configs/20l_4k_1b/ablations/20a0t_parallel_block.yaml)
+(all attention, isolating the merge itself) and
+[`9a11_triglu_no_rope_nested_parallel_block.yaml`](../configs/20l_4k_1b/ablations/9a11_triglu_no_rope_nested_parallel_block.yaml)
+(the 55% hybrid, testing whether merging and replacement compose). Dropping the second
+RMSNorm removes exactly `d_model` weights per block — 10,240 total, about 0.01%, in the
+parallel model's own disfavor — so the comparison is effectively parameter-matched. The
+residual-projection initialization is unchanged because each block still contributes two
+residual updates.
+
+This is the standard "faster training" lever; its scoped question is the speed/quality
+trade of merging the sublayers, not attention replacement. Both are exploratory seed-1337
+probes. Because a parallel block has a single normalization rather than the two-norm
+sequential path, the mechanistic rank analysis (which hooks the sequential mixer and FFN
+norms separately) does not apply to these runs.
+
 ## Exploratory placement/amount sweep (no-RoPE variant)
 
 The single-seed sweep under `configs/20l_4k_1b/placement_amount/` varies replacement
@@ -184,9 +408,18 @@ strictly nested: each larger plan replaces a superset of the smaller plan's laye
 | `6a14_triglu_no_rope_nested.yaml` | 6 | 14 | 6–19 |
 | `15a5_triglu_no_rope_repeating.yaml` | 15 | 5 | 3, 7, 11, 15, 19 |
 | `15a5_triglu_no_rope_tail_block.yaml` | 15 | 5 | 15, 16, 17, 18, 19 |
+| `15a5_triglu_no_rope_early_intrusion.yaml` | 15 | 5 | 3, 12, 15, 17, 19 |
+| `15a5_swiglu_repeating.yaml` (SwiGLU mixer) | 15 | 5 | 3, 7, 11, 15, 19 |
+| `9a11_swiglu_nested.yaml` (SwiGLU mixer) | 9 | 11 | 6, 7, 9–11, 13–15, 17–19 |
 
-These plans are exploratory single-seed probes, subject to the same screening-seed
-caveats as the original sweep: they locate trends and select candidates for focused
+The early-intrusion plan is the front-blend mask with its earliest replacement moved from
+layer 8 to layer 3 (a single swap; later replicated at three seeds). The two SwiGLU-mixer
+probes reuse the no-RoPE plans' masks to test whether placement sensitivity and the
+55%-replacement result persist for the simplest gated formulation.
+
+These plans are exploratory single-seed probes unless replicated, subject to the same
+screening-seed caveats as the original sweep: they locate trends and select candidates for
+focused
 replication; they do not by themselves support confirmatory claims.
 
 ## Post-hoc no-RoPE placement and amount study
@@ -211,7 +444,7 @@ Each replacement set is a strict superset of the previous set. The last transiti
 removes the only late attention layers—`{8, 12, 16}`—from the 9A/11T plan, leaving a
 six-attention prefix followed by fourteen token-local blocks.
 
-The fixed 15A/5T placement comparison uses four distinct masks:
+The fixed 15A/5T placement comparison uses five distinct masks:
 
 | Placement | No-RoPE TriGLU layers |
 | --- | --- |
@@ -219,6 +452,7 @@ The fixed 15A/5T placement comparison uses four distinct masks:
 | nested-ladder rung | `{7, 11, 15, 17, 19}` |
 | repeating | `{3, 7, 11, 15, 19}` |
 | tail block | `{15, 16, 17, 18, 19}` |
+| early intrusion (front blend, 8 → 3) | `{3, 12, 15, 17, 19}` |
 
 Nestedness makes marginal changes along this one removal path readable, but replacement
 count still changes together with the identities of the newly converted layers. The

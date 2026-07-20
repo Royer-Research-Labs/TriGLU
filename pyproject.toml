@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "triglu"
-version = "0.1.0"
+version = "0.2.0"
 description = "Token-local triple-product gating for selectively replacing attention in decoder-only Transformers"
 readme = "README.md"
 requires-python = ">=3.10"

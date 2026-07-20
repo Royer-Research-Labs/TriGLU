@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from triglu.report import generate_report
+from triglu.report import (
+    _effective_ffn_hidden_sizes,
+    _experiment_family,
+    _pareto_front,
+    generate_report,
+)
 
 
 def _write_run(
@@ -18,14 +23,29 @@ def _write_run(
     *,
     complete: bool = True,
     seed: int = 0,
+    ffn_type: str = "swiglu",
+    ffn_hidden_size: int = 16,
+    ffn_hidden_sizes: list[int] | None = None,
+    residual_init_depth: int | None = None,
+    parameter_count: int = 123,
 ) -> None:
     run = root / "suite" / plan
     run.mkdir(parents=True)
     config = {
-        "model": {"n_layers": len(layers), "layer_types": layers, "context_length": 8},
+        "model": {
+            "n_layers": len(layers),
+            "layer_types": layers,
+            "ffn_type": ffn_type,
+            "ffn_hidden_size": ffn_hidden_size,
+            "context_length": 8,
+        },
         "training": {"batch_size": 1, "gradient_accumulation_steps": 1, "seed": seed},
-        "runtime": {"parameter_count": 123},
+        "runtime": {"parameter_count": parameter_count},
     }
+    if ffn_hidden_sizes is not None:
+        config["model"]["ffn_hidden_sizes"] = ffn_hidden_sizes
+    if residual_init_depth is not None:
+        config["model"]["residual_init_depth"] = residual_init_depth
     (run / "resolved_config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     events = [
         {"event": "train", "step": 1, "tokens_seen": 8, "tokens_per_second": speed},
@@ -34,6 +54,24 @@ def _write_run(
     if complete:
         events.append({"event": "complete", "step": 1, "tokens_seen": 8, "best_val_loss": loss})
     (run / "metrics.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    ([16, 20.5], [16, True], [16, 0]),
+)
+def test_report_rejects_malformed_explicit_ffn_width_metadata(
+    schedule: list[object],
+) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        _effective_ffn_hidden_sizes(
+            {
+                "n_layers": 2,
+                "layer_types": ["attention", "attention"],
+                "ffn_hidden_size": 16,
+                "ffn_hidden_sizes": schedule,
+            }
+        )
 
 
 def test_generate_report_writes_tables_and_dependency_free_charts(tmp_path) -> None:
@@ -77,6 +115,14 @@ def test_generate_report_writes_tables_and_dependency_free_charts(tmp_path) -> N
                 "model": {
                     "configured_context_length": 8,
                     "benchmark_context_length": context,
+                    "layer_types": (
+                        ["attention", "attention"]
+                        if plan == "2a0t"
+                        else ["attention", "triglu"]
+                    ),
+                    "ffn_type": "swiglu",
+                    "ffn_hidden_size": 16,
+                    "parameters": 123,
                 },
                 "settings": {
                     "training_sequence_length": context,
@@ -124,6 +170,12 @@ def test_generate_report_writes_tables_and_dependency_free_charts(tmp_path) -> N
     assert "<svg" in (output / "rank_delta-1a1t.svg").read_text(encoding="utf-8")
     assert "1a1t" in (output / "README.md").read_text(encoding="utf-8")
     assert len(report["context_benchmarks"]) == 4
+    assert {
+        row["benchmark_source"] for row in report["context_benchmarks"]
+    } == {
+        "configs/suite/2a0t.yaml",
+        "configs/suite/1a1t.yaml",
+    }
 
 
 def _write_minimal_analysis(path: Path, checkpoint: Path) -> None:
@@ -160,6 +212,60 @@ def _write_minimal_analysis(path: Path, checkpoint: Path) -> None:
         },
     }
     path.write_text(json.dumps(analysis), encoding="utf-8")
+
+
+def test_experiment_family_classification_precedence() -> None:
+    def family(**overrides) -> str:
+        values = {
+            "layer_types": ["attention"] * 4,
+            "ffn_type": "swiglu",
+            "ffn_hidden_sizes": [16] * 4,
+            "residual_init_depth": 4,
+            "block_mode": "sequential",
+        }
+        values.update(overrides)
+        return _experiment_family(**values)
+
+    assert family() == "primary"
+    assert family(layer_types=["attention", "triglu", "attention", "triglu"]) == "primary"
+    assert (
+        family(layer_types=["attention", "triglu_no_rope", "attention", "attention"])
+        == "attention_slot_control"
+    )
+    assert family(ffn_type="triglu_no_rope") == "ffn_form_control"
+    # The combination run (replacement mixers AND a triple-product FFN) is
+    # grouped with the FFN-form controls: topology checks win, then FFN form.
+    assert (
+        family(
+            layer_types=["attention", "triglu_no_rope", "attention", "triglu_no_rope"],
+            ffn_type="triglu_no_rope",
+        )
+        == "ffn_form_control"
+    )
+    # Any structural relaxation dominates: parallel block, ffn_only slots,
+    # nonuniform widths, or a foreign residual-init depth.
+    assert family(block_mode="parallel") == "residual_topology_control"
+    assert (
+        family(layer_types=["attention", "ffn_only", "attention", "attention"])
+        == "residual_topology_control"
+    )
+    assert family(ffn_hidden_sizes=[16, 16, 32, 16]) == "residual_topology_control"
+    assert family(residual_init_depth=20) == "residual_topology_control"
+
+
+def test_pareto_front_maximizes_both_axes() -> None:
+    points = [
+        ("slow_good", 1.0, 10.0),
+        ("fast_bad", 10.0, 1.0),
+        ("dominated", 0.5, 9.0),
+        ("dominated_mid", 5.0, 5.0),
+        ("duplicate_a", 7.0, 7.0),
+        ("duplicate_b", 7.0, 7.0),
+    ]
+    front = _pareto_front(points)
+    # Exact duplicates are mutually non-dominating and both stay on the front;
+    # (5, 5) is strictly dominated by them.
+    assert front == {"slow_good", "fast_bad", "duplicate_a", "duplicate_b"}
 
 
 def test_duplicate_architecture_seed_runs_are_rejected(tmp_path) -> None:
@@ -250,6 +356,10 @@ def test_report_labels_every_token_local_ablation_layer(tmp_path) -> None:
     }
     for layer_type in variants:
         row = by_architecture[f"1a1_{layer_type}"]
+        expected_family = (
+            "primary" if layer_type == "triglu" else "attention_slot_control"
+        )
+        assert row["experiment_family"] == expected_family
         assert row["attention_layers"] == 1
         assert row["token_local_layers"] == 1
         assert row["replacement_mixers"] == f"{layer_type}:1"
@@ -260,3 +370,263 @@ def test_report_labels_every_token_local_ablation_layer(tmp_path) -> None:
     ).read_text(encoding="utf-8").splitlines()[0]
     assert "token_local_layers" in summary_header
     assert "replacement_mixers" in summary_header
+    assert "ffn_type" in summary_header
+    assert "ffn_hidden_size" in summary_header
+
+
+def test_report_separates_ffn_only_blocks_and_nonuniform_widths(tmp_path) -> None:
+    runs = tmp_path / "runs"
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_run(
+        runs,
+        "2a0t",
+        ["attention", "attention"],
+        2.0,
+        100.0,
+    )
+    _write_run(
+        runs,
+        "1a1f_single_residual",
+        ["attention", "ffn_only"],
+        2.1,
+        110.0,
+        ffn_hidden_sizes=[16, 25],
+        residual_init_depth=4,
+        parameter_count=124,
+    )
+    _write_run(
+        runs,
+        "grouped_width_residual_stress",
+        ["attention"],
+        1.9,
+        120.0,
+        ffn_hidden_sizes=[57],
+        residual_init_depth=4,
+        parameter_count=125,
+    )
+
+    report = generate_report(runs_root=runs, results_root=results, suite="suite")
+    rows = {row["architecture"]: row for row in report["architectures"]}
+
+    assert report["schema_version"] == 6
+    assert report["baseline_architecture"] == "2a0t"
+    assert rows["2a0t"]["experiment_family"] == "primary"
+    ffn_only = rows["1a1f_single_residual"]
+    assert ffn_only["experiment_family"] == "residual_topology_control"
+    assert ffn_only["n_layers"] == 2
+    assert ffn_only["attention_layers"] == 1
+    assert ffn_only["token_local_layers"] == 0
+    assert ffn_only["ffn_only_layers"] == 1
+    assert ffn_only["residual_updates_per_forward"] == 3
+    assert ffn_only["replacement_mixers"] == "none"
+    assert ffn_only["structural_controls"] == "ffn_only:1"
+    assert ffn_only["ffn_hidden_sizes"] == [16, 25]
+    assert ffn_only["ffn_width_schedule"] == "16,25"
+    assert ffn_only["ffn_total_hidden_size"] == 41
+    assert ffn_only["residual_init_depth"] == 4
+
+    grouped = rows["grouped_width_residual_stress"]
+    assert grouped["n_layers"] == 1
+    assert grouped["experiment_family"] == "residual_topology_control"
+    assert grouped["attention_layers"] == 1
+    assert grouped["ffn_only_layers"] == 0
+    assert grouped["residual_updates_per_forward"] == 2
+    assert grouped["structural_controls"] == "grouped_width_or_depth"
+    assert grouped["ffn_hidden_sizes"] == [57]
+    assert grouped["residual_init_depth"] == 4
+
+    header = (
+        results / "suite-report" / "summary_by_architecture.csv"
+    ).read_text(encoding="utf-8").splitlines()[0]
+    for field in (
+        "n_layers",
+        "experiment_family",
+        "ffn_only_layers",
+        "ffn_width_schedule",
+        "ffn_total_hidden_size",
+        "residual_init_depth",
+    ):
+        assert field in header
+    generated_readme = (
+        results / "suite-report" / "README.md"
+    ).read_text(encoding="utf-8")
+    assert "Model range: 1–2 physical blocks" in generated_readme
+    assert "### Residual-topology controls" in generated_readme
+
+
+def test_report_rejects_replica_parameter_or_budget_drift(tmp_path) -> None:
+    runs = tmp_path / "runs"
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_run(
+        runs,
+        "2a0t",
+        ["attention", "attention"],
+        2.0,
+        100.0,
+        seed=0,
+        parameter_count=123,
+    )
+    _write_run(
+        runs,
+        "2a0t_seed9",
+        ["attention", "attention"],
+        2.1,
+        101.0,
+        seed=9,
+        parameter_count=124,
+    )
+
+    with pytest.raises(ValueError, match="inconsistent parameter_count"):
+        generate_report(runs_root=runs, results_root=results, suite="suite")
+
+
+def test_ffn_control_is_reported_separately_without_replacing_baseline(
+    tmp_path,
+) -> None:
+    runs = tmp_path / "runs"
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_run(
+        runs,
+        "2a0t",
+        ["attention", "attention"],
+        2.0,
+        100.0,
+        ffn_type="swiglu",
+        ffn_hidden_size=16,
+    )
+    # Give the experimental FFN a better loss to exercise the baseline guard.
+    _write_run(
+        runs,
+        "2a0t_triglu_no_rope_ffn",
+        ["attention", "attention"],
+        1.9,
+        105.0,
+        ffn_type="triglu_no_rope",
+        ffn_hidden_size=12,
+    )
+
+    report = generate_report(runs_root=runs, results_root=results, suite="suite")
+
+    assert report["baseline_architecture"] == "2a0t"
+    rows = {row["architecture"]: row for row in report["architectures"]}
+    assert rows["2a0t"]["ffn_type"] == "swiglu"
+    assert rows["2a0t"]["experiment_family"] == "primary"
+    assert rows["2a0t"]["ffn_hidden_size"] == 16
+    control = rows["2a0t_triglu_no_rope_ffn"]
+    assert control["experiment_family"] == "ffn_form_control"
+    assert control["ffn_type"] == "triglu_no_rope"
+    assert control["ffn_hidden_size"] == 12
+    assert control["loss_delta_vs_baseline_mean"] == pytest.approx(-0.1)
+
+    generated = (
+        results / "suite-report" / "summary_by_architecture.csv"
+    ).read_text(encoding="utf-8")
+    assert "ffn_type" in generated.splitlines()[0]
+    assert "2a0t_triglu_no_rope_ffn" in generated
+
+
+def test_context_benchmark_with_mislabeled_layer_plan_is_rejected(tmp_path) -> None:
+    runs = tmp_path / "runs"
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_run(runs, "2a0t", ["attention", "attention"], 2.0, 100.0)
+    artifact = {
+        "event": "benchmark",
+        "benchmark_label": "context-scaling",
+        "source": "configs/suite/2a0t.yaml",
+        "model": {
+            "parameters": 123,
+            "configured_context_length": 8,
+            "benchmark_context_length": 8,
+            "layer_types": ["attention", "triglu"],
+            "ffn_type": "swiglu",
+            "ffn_hidden_size": 16,
+        },
+        "settings": {
+            "training_sequence_length": 8,
+            "prompt_length": 6,
+            "decode_tokens": 2,
+            "warmup": 1,
+            "iterations": 2,
+        },
+        "training": {},
+        "prefill": {},
+        "cached_decode": {},
+    }
+    (results / "mislabeled.json").write_text(
+        json.dumps(artifact), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="layer plan"):
+        generate_report(runs_root=runs, results_root=results, suite="suite")
+
+
+def test_context_benchmark_with_wrong_structural_metadata_is_rejected(
+    tmp_path,
+) -> None:
+    runs = tmp_path / "runs"
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_run(
+        runs,
+        "1a1f_single_residual",
+        ["attention", "ffn_only"],
+        2.0,
+        100.0,
+        ffn_hidden_sizes=[16, 25],
+        residual_init_depth=4,
+    )
+    artifact = {
+        "event": "benchmark",
+        "benchmark_label": "context-scaling",
+        "source": "configs/suite/1a1f_single_residual.yaml",
+        "model": {
+            "parameters": 123,
+            "n_layers": 2,
+            "configured_context_length": 8,
+            "benchmark_context_length": 8,
+            "layer_types": ["attention", "ffn_only"],
+            "ffn_type": "swiglu",
+            "ffn_hidden_size": 16,
+            "ffn_hidden_sizes": [16, 26],
+            "residual_init_depth": 4,
+        },
+        "settings": {
+            "training_sequence_length": 8,
+            "prompt_length": 6,
+            "decode_tokens": 2,
+            "warmup": 1,
+            "iterations": 2,
+        },
+        "training": {},
+        "prefill": {},
+        "cached_decode": {},
+    }
+    (results / "wrong-schedule.json").write_text(
+        json.dumps(artifact),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="width schedule"):
+        generate_report(runs_root=runs, results_root=results, suite="suite")
+
+    artifact["model"]["ffn_hidden_sizes"] = [16, 25]
+    artifact["model"]["ffn_total_hidden_size"] = 42
+    (results / "wrong-schedule.json").write_text(
+        json.dumps(artifact),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="declares FFN total"):
+        generate_report(runs_root=runs, results_root=results, suite="suite")
+
+    artifact["model"]["ffn_total_hidden_size"] = 41
+    artifact["model"]["residual_init_depth"] = 5
+    (results / "wrong-schedule.json").write_text(
+        json.dumps(artifact),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="residual init depth"):
+        generate_report(runs_root=runs, results_root=results, suite="suite")

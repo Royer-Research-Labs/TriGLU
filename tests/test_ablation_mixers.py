@@ -6,7 +6,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from triglu import MBMLP, ModelConfig, RopeModule, SwiGLUMixer, TriGLU
+from triglu import (
+    MBMLP,
+    ModelConfig,
+    RopeModule,
+    SwiGLU,
+    SwiGLUMixer,
+    TriGLU,
+    TriGLUFFN,
+)
 
 
 def tiny_config(layer_type: str, *, bias: bool = True) -> ModelConfig:
@@ -95,6 +103,39 @@ def test_swiglu_mixer_matches_documented_equation() -> None:
     assert cache is None
 
 
+def test_triglu_ffn_matches_exact_no_rope_equation() -> None:
+    torch.manual_seed(207)
+    config = tiny_config("attention")
+    ffn = TriGLUFFN(config)
+    x = torch.randn(2, 3, config.d_model)
+
+    actual = ffn(x)
+    k, g, v = F.linear(x, ffn.c_proj.weight, ffn.c_proj.bias).chunk(3, dim=-1)
+    expected = F.linear(
+        k * F.silu(g) * v,
+        ffn.down_proj.weight,
+        ffn.down_proj.bias,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_triglu_ffn_is_token_local() -> None:
+    torch.manual_seed(208)
+    config = tiny_config("attention")
+    ffn = TriGLUFFN(config).eval()
+    x = torch.randn(1, 5, config.d_model)
+    changed = x.clone()
+    changed[:, 2] += 100.0
+
+    before = ffn(x)
+    after = ffn(changed)
+
+    torch.testing.assert_close(before[:, :2], after[:, :2])
+    torch.testing.assert_close(before[:, 3:], after[:, 3:])
+    assert not torch.equal(before[:, 2], after[:, 2])
+
+
 @pytest.mark.parametrize(
     ("layer_type", "factory"),
     [
@@ -180,3 +221,80 @@ def test_512_wide_swiglu_control_is_nearest_integer_parameter_match() -> None:
 
     assert actual == 3 * config.d_model * 683
     assert actual - attention_or_triglu == 512
+
+
+def test_triglu_ffn_exactly_matches_bias_free_swiglu_projection_count() -> None:
+    channels = 64
+    swiglu_hidden = 176
+    triglu_hidden = 132
+    common = {
+        "vocab_size": 32,
+        "n_layers": 1,
+        "d_model": channels,
+        "n_heads": 1,
+        "context_length": 16,
+        "bias": False,
+        "layer_types": ["attention"],
+    }
+    swiglu = SwiGLU(
+        ModelConfig(
+            **common,
+            ffn_hidden_size=swiglu_hidden,
+            ffn_type="swiglu",
+        )
+    )
+    triglu = TriGLUFFN(
+        ModelConfig(
+            **common,
+            ffn_hidden_size=triglu_hidden,
+            ffn_type="triglu_no_rope",
+        )
+    )
+    swiglu_count = sum(parameter.numel() for parameter in swiglu.parameters())
+    triglu_count = sum(parameter.numel() for parameter in triglu.parameters())
+
+    assert swiglu_count == 3 * channels * swiglu_hidden
+    assert triglu_count == 4 * channels * triglu_hidden
+    assert triglu_count == swiglu_count == 33_792
+
+
+def test_biased_triglu_ffn_uses_formula_without_claiming_exact_parity() -> None:
+    channels = 64
+    swiglu_hidden = 176
+    triglu_hidden = 132
+    common = {
+        "vocab_size": 32,
+        "n_layers": 1,
+        "d_model": channels,
+        "n_heads": 1,
+        "context_length": 16,
+        "bias": True,
+        "layer_types": ["attention"],
+    }
+    swiglu = SwiGLU(
+        ModelConfig(
+            **common,
+            ffn_hidden_size=swiglu_hidden,
+            ffn_type="swiglu",
+        )
+    )
+    triglu = TriGLUFFN(
+        ModelConfig(
+            **common,
+            ffn_hidden_size=triglu_hidden,
+            ffn_type="triglu_no_rope",
+        )
+    )
+    swiglu_count = sum(parameter.numel() for parameter in swiglu.parameters())
+    triglu_count = sum(parameter.numel() for parameter in triglu.parameters())
+    expected_swiglu = (
+        3 * channels * swiglu_hidden + 2 * swiglu_hidden + channels
+    )
+    expected_triglu = (
+        4 * channels * triglu_hidden + 3 * triglu_hidden + channels
+    )
+
+    assert swiglu_count == expected_swiglu
+    assert triglu_count == expected_triglu
+    assert triglu_count - swiglu_count == 44
+    assert triglu_count != swiglu_count

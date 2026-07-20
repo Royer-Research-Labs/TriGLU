@@ -39,10 +39,13 @@ batch after an out-of-memory error.
 
 Inference reports prefill and cached-decode throughput separately. Only attention layers
 have growing logical key/value content; TriGLU and the explicitly labeled token-local
-controls retain position metadata only. The benchmark preallocates attention cache
-capacity to avoid timing repeated history copies. Record context length, generated
-length, batch size, peak allocated memory, logically used cache bytes, and allocated
-cache capacity.
+attention-slot controls retain position metadata only. `TriGLUFFN` owns no cache
+interface, while the attention sublayers in its all-attention control retain their full
+KV state. An `ffn_only` structural-control block also retains position metadata only; it
+has no attention/replacement mixer and must not be counted as a token-local replacement
+mixer. The benchmark preallocates attention cache capacity to avoid timing repeated
+history copies. Record context length, generated length, batch size, peak allocated
+memory, logically used cache bytes, and allocated cache capacity.
 
 Context lengths above a checkpoint's training configuration may be used to measure
 architecture-level runtime and memory scaling when the benchmark records both configured
@@ -53,15 +56,24 @@ trained context window.
 Repeated context benchmarks must be retained as separate raw artifacts. For derived
 tables and figures, the bundled reporter selects the artifact with the greatest number
 of measured iterations for each architecture/context pair; ties retain the first artifact
-in deterministic path order.
+in deterministic path order. Schema-v2 benchmark artifacts must record physical depth, the exact
+mixer/block plan, global FFN type, effective per-layer FFN-width schedule, total FFN
+hidden width, and effective residual-initialization depth. Legacy artifacts without a
+width schedule normalize to `[ffn_hidden_size] * n_layers`; missing residual-init depth
+normalizes to physical depth. New nonuniform models must record their explicit schedule.
+These checks prevent FFN-form and residual-topology controls from being mistaken for the
+conventional all-attention baseline.
 
 ## Mechanistic diagnostics
 
-Schema-v2 rank analyses record centered channel-covariance spectra at seven points in
-each decoder block: block input, normalized mixer input, mixer update, post-mixer
-residual, normalized FFN input, FFN update, and block output. Compact summaries include
-entropy effective rank, participation ratio, stable rank, rank deltas, update/residual
-scale, and update/residual direction.
+Schema-v3 rank analyses record centered channel-covariance spectra at seven points in
+each ordinary decoder block: block input, normalized mixer input, mixer update,
+post-mixer residual, normalized FFN input, FFN update, and block output. An `ffn_only`
+block has only four real stages—block input, normalized FFN input, FFN update, and block
+output—so mixer rows are omitted rather than synthesized as zero-rank operations. Its
+FFN rank delta is measured directly from block input to output. Compact summaries
+include entropy effective rank, participation ratio, stable rank, rank deltas,
+update/residual scale, and update/residual direction.
 
 Layer sensitivity zeros one trained residual update at a time while retaining all other
 sublayers. This is an out-of-distribution intervention. A large loss delta shows that the
@@ -87,11 +99,25 @@ removed jointly.
 - SVG files visualize quality/throughput, learning curves, activation geometry, update
   scale, and intervention sensitivity.
 
-The summary tables expose `attention_layers`, `token_local_layers`, and
-`replacement_mixers`, plus a count for each supported replacement type. This keeps
-secondary-control runs distinguishable instead of folding every token-local layer into
-the TriGLU count. Architecture names are derived from the run directory after removing a
-trailing `_seed<integer>` replication suffix.
+Schema-v6 summary tables expose physical `n_layers`, `attention_layers`,
+`token_local_layers`, `ffn_only_layers`, `replacement_mixers`,
+`residual_updates_per_forward`, `structural_controls`, `ffn_type`, the legacy/default
+scalar `ffn_hidden_size`, the exact
+`ffn_width_schedule`, `ffn_total_hidden_size`, and `residual_init_depth`, plus a count for
+each supported replacement type. `ffn_only_layers` are deliberately excluded from
+`token_local_layers` and `replacement_mixers`: they contain a token-local operation but
+are structural block controls, not attention-slot mixers. This keeps attention-slot,
+FFN-form, and residual-topology controls distinguishable. The derived
+`experiment_family` field separates `primary`, `attention_slot_control`,
+`ffn_form_control`, and `residual_topology_control` rows, and the generated Markdown
+report presents those families in separate tables. Replicas grouped under one
+architecture must also agree on parameter count, physical depth and exact layer plan,
+width schedule, initialization depth, context, token/evaluation budgets, and validation
+data identity.
+Architecture names are derived from the run directory after removing a trailing
+`_seed<integer>` replication suffix. Automatic baseline-relative metrics prefer the
+canonical conventional-SwiGLU all-attention architecture; a lower-loss all-attention
+FFN control cannot silently become the baseline.
 
 The reporter can be rerun after new raw artifacts arrive. Derived files should not be
 edited by hand.

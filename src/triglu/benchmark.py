@@ -384,6 +384,7 @@ def run_benchmarks(
 
     result: dict[str, Any] = {
         "event": "benchmark",
+        "schema_version": 2,
         "benchmark_label": label,
         "time": utc_now(),
         "source": str(checkpoint_path if checkpoint_path is not None else config_path),
@@ -396,6 +397,14 @@ def run_benchmarks(
             "configured_context_length": configured_context_length,
             "benchmark_context_length": model_config.context_length,
             "layer_types": list(model_config.layer_types),
+            "ffn_type": model_config.ffn_type,
+            "ffn_hidden_size": model_config.ffn_hidden_size,
+            "ffn_hidden_sizes": model_config.effective_ffn_hidden_sizes,
+            "ffn_total_hidden_size": sum(
+                model_config.effective_ffn_hidden_sizes
+            ),
+            "residual_init_depth": model_config.effective_residual_init_depth,
+            "block_mode": model_config.block_mode,
         },
         "settings": {
             "batch_size": batch_size,

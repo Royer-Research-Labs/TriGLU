@@ -1,15 +1,21 @@
-# TriGLU: a token-local gated alternative to selected attention layers
+# TriGLU: a controlled study of replacing attention with token-local gating
 
 [![tests](https://github.com/Royer-Research-Labs/TriGLU/actions/workflows/tests.yml/badge.svg)](https://github.com/Royer-Research-Labs/TriGLU/actions/workflows/tests.yml)
 
-TriGLU—the **Triple-Product Gated Linear Unit**—is a token-local channel mixer designed
-for use in place of selected causal-attention sublayers. It applies three projected
-factors at each token independently and requires no KV cache. This repository provides
-both a small, readable PyTorch implementation and a controlled decoder-only Transformer
-harness for measuring quality, training throughput, inference throughput, memory, and
-KV-cache trade-offs on one NVIDIA GPU. Parameter-matched token-local controls and an
-explicit placement/amount sweep separate what fills a vacated attention slot from where
-and how much attention is replaced.
+TriGLU—the **Triple-Product Gated Linear Unit**—is a token-local channel mixer,
+`W_o[k · SiLU(g) · v]`, that fell out of an ablation and turned out to improve small
+decoder-only Transformers in two roles: as a parameter-matched replacement for selected
+causal-attention layers (efficiency at quality parity) and as an FFN (the largest single
+quality gain we measured). This repository provides a small, readable PyTorch
+implementation of the component and the controlled harness used to map *how much*
+attention a decoder actually needs and *where* — measuring quality, throughput, memory,
+and KV-cache across parameter-matched token-local controls and an explicit
+placement/amount sweep, so that what fills a vacated attention slot is separated from
+where and how much attention is replaced.
+
+The recommended form is the no-RoPE variant; the RoPE variant is TriGLU's ablation origin
+and is retained as a control (see [the exact component](#the-exact-triglu-component) and
+[`docs/related-work.md`](docs/related-work.md)).
 
 The scientific question is deliberately narrow:
 
@@ -22,6 +28,11 @@ The secondary controls extend it with one follow-on question:
 > How much of that answer is set by where and how much attention is replaced,
 > rather than by the exact token-local formulation filling the slot?
 
+One additional all-attention control asks a separate question:
+
+> Is the cache-free, no-RoPE triple-product form competitive with conventional
+> SwiGLU when both are used in the decoder FFN slot at exact parameter parity?
+
 TriGLU originated as an ablation in which cross-token mixing was removed from a richer
 experimental mixer. The token-local remainder retained enough empirical promise to merit
 an independent test. The richer mixer is not included here: this repository isolates the
@@ -32,6 +43,8 @@ attention/TriGLU layer plan. Comparisons between the 12-layer and 20-layer suite
 controlled ablations because their depth, context, and training budget differ. Three
 secondary controls compare TriGLU's positional branch, triple-branch fusion, and third
 multiplicative factor against the closest alternatives identified in the prior-art review.
+The separately labeled FFN-form control leaves the all-attention plan unchanged and is
+not evidence about attention replacement.
 
 ## Repository scope and evidence
 
@@ -41,9 +54,9 @@ a tiny offline smoke configuration are included. Installation and tests never la
 full experiment suite.
 
 Only results accompanied by resolved configs, metric streams, data hashes, and runtime
-metadata are treated as reproduced evidence. The legacy figures in `assets/` do not have
-that complete provenance and are excluded from the reported comparisons. The publication
-requirements are defined in [`docs/results-schema.md`](docs/results-schema.md).
+metadata are treated as reproduced evidence; anything without that complete provenance is
+excluded from the reported comparisons. The publication requirements are defined in
+[`docs/results-schema.md`](docs/results-schema.md).
 
 ### Reading guide
 
@@ -59,24 +72,49 @@ requirements are defined in [`docs/results-schema.md`](docs/results-schema.md).
 
 ## Evidence summary
 
-In the completed 89M-parameter experiment, two hybrids that replaced five of twenty
-attention layers retained the all-attention baseline's validation quality after one
-billion FineWeb-Edu training tokens. Both used an attention-rich lower stack and retained
-attention across later depth.
+All results are from an 89M-parameter, 20-layer decoder trained on one billion
+FineWeb-Edu tokens at 4K context. Mean validation loss is reported over three seeds unless
+a finding is marked exploratory (single seed). The headline is that a small decoder's
+attention is more replaceable than assumed, and that *placement and amount*, not the exact
+token-local formulation, are the primary levers.
 
-Across the two confirmatory seeds, `15a5t_front_blend` differs from the attention baseline
-by -0.00089 mean validation loss and `15a5t_final_attention` by +0.00087. Their observed
-training throughput is approximately 7% higher. Controlled 4K benchmarks show 5–9% faster
-prefill, 8–10% faster cached decode, and exactly 25% less allocated KV-cache capacity.
-For the front-blend hybrid, controlled training and prefill gains rise to 15.8% and 19.8%
-at 16K; those contexts are efficiency extrapolations because quality training stopped at
-4K.
+- **Attention is substantially replaceable at quality parity.** Replacing 25% of attention
+  layers with any parameter-matched token-local mixer matched or beat the all-attention
+  baseline (loss 3.4617); the simplest two-factor SwiGLU control did best (3.4327).
+  Replacing 55% with no-RoPE TriGLU still beat the baseline (3.4471) — and there the extra
+  multiplicative factor earns its keep: the two-factor control regresses to attention
+  parity (3.4621) at that ratio. In controlled 4K benchmarks the 55% hybrid trains about
+  **19% faster**, prefills ~40% faster, decodes ~50% faster, and allocates **55% less
+  KV-cache**; the throughput gains widen with context (to ~49% training at 16K, an
+  efficiency extrapolation above the 4K training length).
+- **TriGLU is also the best FFN we tested.** With all attention retained, swapping the
+  standard SwiGLU FFN for the no-RoPE triple-product form is the single largest quality
+  gain in the study (3.4313, −0.030 vs baseline). Its cost is small — within 1.4% on
+  controlled training throughput (~6% on observed training logs) — but it keeps the full
+  KV cache, so it buys quality, not efficiency.
+- **The two roles do not stack** (exploratory): combining 55% replacement with a
+  triple-product FFN (3.4564) is worse than either alone — the FFN gain needs the attention
+  intact. The recommended configurations are therefore goal-specific: the 55% replacement
+  hybrid for efficiency at parity, or the all-attention triple-product FFN for maximum
+  quality.
+- **The hybrid is more than parameter budget — but structure isn't free.** A
+  parameter-matched model that collapses the 20-layer hybrid into 9 attention layers with
+  the freed budget in fat FFNs is measurably worse on quality (structure gap 0.022–0.041,
+  replicated), so distributed structure and depth contribute beyond parameter count. The
+  collapse is, however, faster — up to +50% controlled cached decode from its shorter
+  serial path — so collapsing trades quality for speed rather than being refuted.
+- **Placement matters at fixed amount**, and merging attention with the FFN into a
+  single-norm parallel block is roughly neutral on both quality and throughput
+  (exploratory), so the replacement efficiency is its own lever, not a parallel-block
+  speedup in disguise.
 
-These results position TriGLU as a hybrid component for selectively reducing attention,
-especially at longer contexts. They do not show that TriGLU improves quality or can replace
-all token mixing. Placement matters, and the mechanistic diagnostics do not identify one
-universal rank-collapse threshold. Read the [complete results and limitations](docs/results.md)
-and the [exploratory screening table](docs/screening-results.md).
+These results do not show that TriGLU is the uniquely best mixer, that its equation is
+novel (it is a GQU-family gate), that any of this holds at frontier scale, or that
+attention can be removed entirely — every hybrid depends on its retained attention layers
+for all cross-token communication. Read the
+[complete results and limitations](docs/results.md), the
+[related-work comparison](docs/related-work.md), and the
+[exploratory screening table](docs/screening-results.md).
 
 Large checkpoints, prepared corpora, and mutable run directories are excluded from the
 source distribution. The [results/provenance protocol](docs/results-schema.md) specifies
@@ -84,19 +122,26 @@ the records needed to audit or reproduce reported comparisons.
 
 ## The exact TriGLU component
 
-For input `x` with shape `[batch, tokens, channels]`, `C = channels`:
+For input `x` with shape `[batch, tokens, channels]`, `C = channels`, the recommended form
+is:
 
 ```text
 k, g, v = split_3(Linear_C_to_3C(x))
-k       = RoPE(k, offset=position)
 y       = k * SiLU(g) * v
 y       = Linear_C_to_C(y)
 ```
 
-Both products are elementwise. RoPE is applied to the full `C`-wide `k` stream only.
-There is no attention matrix, convolution, recurrence, reduction over tokens, or other
-cross-token operation. Position affects a token's channel transform, but one token cannot
-read another token inside this component.
+Both products are elementwise. There is no attention matrix, convolution, recurrence,
+reduction over tokens, or other cross-token operation: one token cannot read another inside
+this component.
+
+**RoPE is an optional variant, not part of the recommended form.** TriGLU originated as an
+ablation whose `k` branch carried a rotary embedding, and v0.1.0 shipped that RoPE form as
+the default. The controlled experiments here found the no-RoPE form above to be the better
+attention replacement, so it is now recommended; the RoPE variant — the same equation with
+`k = RoPE(k, offset=position)` inserted before the product — is retained as TriGLU's origin
+and as the control that isolates the positional branch. Both are the same `TriGLU`
+component: no-RoPE via `rope=None` (recommended), RoPE via a supplied `RopeModule`.
 
 The mixer itself does not require or apply normalization. The evaluated decoder wrapper
 passes `RMSNorm(x)`; another integration is responsible for defining its own input
@@ -104,8 +149,8 @@ normalization policy.
 
 The name describes its relationship to the GLU family. A SwiGLU combines two projected
 factors, `SiLU(g) * v`; TriGLU adds the third projected factor `k`, giving the exact
-triple product `RoPE(k) * SiLU(g) * v`. “Tri” refers to these three factors, not three
-separate gates. The terminology follows the original
+triple product `k * SiLU(g) * v`. “Tri” refers to these three factors, not three separate
+gates, and does not depend on RoPE. The terminology follows the original
 [Gated Linear Unit](https://arxiv.org/abs/1612.08083) and subsequent
 [Transformer GLU-variant](https://arxiv.org/abs/2002.05202) literature.
 
@@ -133,29 +178,33 @@ it inside an existing block topology without inheriting repository-specific scaf
 | --- | --- |
 | Input/output | `[batch, tokens, channels]` with unchanged shape |
 | Cross-token mixing | None |
-| Position input | Absolute `cache_position`, applied through full-width RoPE on `k` |
+| Position input | None in the recommended form (position-independent); the RoPE variant applies full-width RoPE on `k` at `cache_position` |
 | Training parameters | One `C → 3C` projection and one `C → C` projection |
 | Autoregressive state | Position integer only; no K/V tensors |
 | Return value | `(output, cache_or_none)` |
 
-Minimal construction inside another PyTorch model is:
+Minimal construction inside another PyTorch model — the recommended no-RoPE form:
 
 ```python
-from triglu import RopeModule, TriGLU
+from triglu import TriGLU
 
-rope = RopeModule(config.d_model, theta=config.rope_theta)
-mixer = TriGLU(config, rope)
+mixer = TriGLU(config, rope=None)
 y, next_cache = mixer(x, cache_position=position, use_cache=use_cache)
+
+# The RoPE origin variant, retained as a control, instead supplies a rotation:
+#   from triglu import RopeModule
+#   mixer = TriGLU(config, RopeModule(config.d_model, theta=config.rope_theta))
 ```
 
-`config` must expose `d_model`, `bias`, and `rope_theta` as used by this repository's
-`ModelConfig`. The experimental claims in this repository apply to the decoder wrapper
-below; integrations using a different wrapper are valid uses of the mixer but constitute
-separate experiments.
+`config` must expose `d_model` and `bias` (and `rope_theta` only for the RoPE variant) as
+used by this repository's `ModelConfig`. The experimental claims in this repository apply
+to the decoder wrapper below; integrations using a different wrapper are valid uses of the
+mixer but constitute separate experiments.
 
 ## Controlled decoder architecture
 
-Both primary mixer choices use the same conventional pre-norm wrapper:
+Both primary mixer choices use the same conventional pre-norm wrapper and the same
+conventional FFN:
 
 ```text
 h     = x + mixer(RMSNorm(x))
@@ -184,8 +233,12 @@ placements.
 The primary ratio and placement suites add no GQA/MQA, sliding attention, experimental
 temporal mixer, alternative gate/FFN family, custom positional encoding or normalization,
 convolution, state-space layer, MoE, shared-weight bank, or proprietary architecture
-component. The three explicitly labeled prior-art controls are secondary experiments and
-do not alter the authoritative `TriGLU` class.
+component. The explicitly labeled attention-slot controls and the separate
+all-attention FFN-form control are secondary experiments. A family of residual-topology
+stress controls — FFN-only slots, the parameter-matched 9-layer collapses, a shallow
+capacity anchor, and single-norm parallel blocks — deliberately leaves the fixed-wrapper
+comparison and is reported separately. None changes the authoritative `TriGLU` class or
+the primary architecture.
 
 ## Install and verify
 
@@ -329,8 +382,9 @@ accumulation 1. This preserves the shared 65,536 tokens per optimizer update whi
 moving the comparison into a regime where attention's quadratic work is material. Their
 outputs are grouped under `runs/20l_4k_1b/<plan>/`.
 
-Every plan has 89,018,880 trainable parameters and evaluates 1,048,576 target tokens at
-each evaluation point. The completed screening runs allocated up to approximately
+Each of the nine primary plans has 89,018,880 trainable parameters and evaluates
+1,048,576 target tokens at each evaluation point. The completed screening runs allocated
+up to approximately
 45.2 GiB of CUDA memory and took roughly 75–90 minutes per plan on an NVIDIA RTX PRO 6000
 Blackwell Workstation Edition. Treat those values as observed reference points, not
 portable requirements: compiler, kernel, and GPU versions materially affect both memory
@@ -447,7 +501,8 @@ as the primary comparison and its throughput as implementation-specific rather t
 general SwiGLU efficiency result. The MB-MLP control adapts the published fusion equation
 to the same-width decoder slot by retaining this harness's output projection.
 
-Verify all three new code paths together with a two-step CPU smoke run:
+Verify the three attention-slot controls and the separate `TriGLUFFN` path together with
+a two-step CPU smoke run:
 
 ```bash
 python -m triglu.train \
@@ -474,6 +529,46 @@ incomplete directory, and regenerates the suite report afterward. Outputs remain
 `runs/20l_4k_1b/<plan>/`; configs are grouped under
 `configs/20l_4k_1b/ablations/`. Set `PYTHON_BIN` as for the replication launcher when
 needed.
+
+### All-attention FFN-form control
+
+This separately labeled control tests the triple-product form as a channel FFN rather
+than as an attention replacement. Both models keep all 20 causal-attention sublayers.
+The baseline uses the repository's conventional SwiGLU in every FFN slot:
+
+```text
+FFN_swiglu(x) = W_down[SiLU(W_gate x) * W_up x].
+```
+
+The control changes every FFN slot to the cache-free, no-RoPE form:
+
+```text
+(k, g, v)   = split_3(W_c x)
+FFN_triglu(x) = W_down[k * SiLU(g) * v].
+```
+
+All products are elementwise. This FFN has no positional input, cross-token operation,
+or cache state of its own. The attention sublayers and their KV caches are unchanged, so
+this experiment tests FFN competitiveness; it does not test attention replacement,
+long-context quality, or KV-cache reduction.
+
+The supplied bias-free `d_model = 512` control is exactly parameter matched. A
+width-1376 SwiGLU has `3 * 512 * 1376 = 2,113,536` projection weights per block. A
+width-1032 triple-product FFN has `4 * 512 * 1032 = 2,113,536`. With identical attention,
+normalization, residual topology, embeddings, and output head, both complete models
+therefore have 89,018,880 parameters. Data order, optimizer, schedule, and token budget
+also remain matched. Conventional SwiGLU remains the default FFN for the primary suites
+and every attention-slot control.
+
+Run the exploratory seed directly with:
+
+```bash
+python -m triglu.train \
+  --config configs/20l_4k_1b/ablations/20a0t_triglu_no_rope_ffn.yaml
+```
+
+The guarded final launcher below runs this control at seeds 1337, 2357, and 7331 and
+includes it in the final benchmark cleanup.
 
 ### Exploratory placement and amount sweep
 
@@ -544,6 +639,168 @@ plan and its immediate neighbors on matched seeds before presenting the schedule
 general result. A same-count spread supports placement sensitivity; the nested ladder
 tests one predeclared conversion path rather than exhaustively searching all layer masks.
 
+### Focused replications and benchmark cleanup
+
+The final guarded queue validates seven training targets. It replicates two exploratory
+findings at confirmatory seeds 2357 and 7331:
+
+- the `15a5_triglu_no_rope_early_intrusion` single-swap placement control; and
+- the `9a11_swiglu_nested` aggressive-replacement equation control.
+
+It also runs the all-attention TriGLU-form FFN control at seeds 1337, 2357, and 7331.
+Already completed exact targets are validated and skipped. After all seven targets are
+complete, the same launcher measures a contemporaneous
+seven-architecture context cohort at 4K, 8K, and 16K. These validation benchmarks use 10
+warmups and 100 measured iterations. They preserve the original raw measurements under
+their existing filenames and write higher-sample artifacts ending in
+`-final-validation-benchmark.json`; the reporter selects the larger measured sample.
+
+Run the complete guarded queue with:
+
+```bash
+bash scripts/run_final_replications_and_benchmarks.sh
+```
+
+The launcher uses `python` from the active environment. A different compatible
+interpreter can be selected explicitly:
+
+```bash
+PYTHON_BIN=/path/to/python \
+  bash scripts/run_final_replications_and_benchmarks.sh
+```
+
+To validate every source config, existing destination, reference run, benchmark target,
+runtime requirement, and GPU availability without starting work:
+
+```bash
+PREFLIGHT_ONLY=1 bash scripts/run_final_replications_and_benchmarks.sh
+```
+
+The launcher parses metric streams and resolved configurations before skipping a run,
+refuses incomplete or mismatched destinations, stops on the first failure, and preserves
+raw run and benchmark artifacts. It regenerates the derived report files after training
+and benchmarking.
+The context measurements instantiate models from the published configurations rather
+than loading trained checkpoints; they measure architecture/runtime behavior, not
+post-training language-model quality. Contexts above 4K remain efficiency
+extrapolations because the models were trained at 4K.
+
+### Residual-topology stress controls
+
+These post-hoc, seed-1337 experiments test architectural explanations suggested by the
+placement sweep. They are not additional TriGLU component comparisons.
+
+The exactly parameter-matched single-residual control keeps 20 physical blocks and the
+selected front-blend positions `{8, 12, 15, 17, 19}`. At those five positions it replaces
+the complete mixer-plus-FFN block
+
+```text
+h = x + mixer(RMSNorm(x))
+y = h + SwiGLU_1376(RMSNorm(h))
+```
+
+with one wider channel update:
+
+```text
+y = x + SwiGLU_2059(RMSNorm(x)).
+```
+
+For `d_model = 512` and `bias: false`, the sole norm plus width-2059 SwiGLU has exactly
+the same parameters as the removed mixer, two norms, and width-1376 SwiGLU:
+
+```text
+512 + 3*512*2059 = 2*512 + 4*512^2 + 3*512*1376 = 3,163,136.
+```
+
+The complete model therefore remains exactly 89,018,880 parameters. This control jointly
+tests attention removal, residual depth, normalization count, and consolidated channel
+capacity; it cannot isolate any one of those factors by itself. Exact parameter matching
+also does not guarantee equal initial residual-update RMS or hardware efficiency.
+
+The more aggressive residual-depth stress test starts from the nested 9-attention/11
+no-RoPE schedule, removes all eleven token-local blocks, and keeps only nine physical
+attention blocks. Each retained attention block receives the parameter budget of the
+blocks that followed it before the next attention. The resulting SwiGLU widths are
+`[1376, 1376, 1376, 1376, 1376, 5495, 7554, 7554, 7554]`. The model has 18 residual
+updates instead of 40, retains nine attention operations and nine KV caches, and has
+89,019,392 parameters—512 (+0.0006%) above the reference because hidden widths must be
+integers. `residual_init_depth: 20` preserves the reference
+`init_std / sqrt(40)` per-weight output-projection standard deviation, avoiding an
+additional depth-based increase. It does not equalize initial residual-update RMS:
+the much wider FFNs can still produce larger updates. That width-dependent scale is part
+of this stress test and should be measured rather than treated as controlled away.
+
+Two follow-on controls separate the FFN equation from the grouped-width allocation and
+provide a practical shallow baseline:
+
+- `9l_9a0t_grouped_triglu_no_rope_ffn` keeps the same nine attention blocks,
+  grouped topology, 20-layer residual initialization, and near-exact parameter budget
+  as the grouped SwiGLU control, but replaces its FFNs with no-RoPE triple-product
+  FFNs. Integer widths leave a 512-parameter difference between the two 89.02M models.
+- `9l_9a0t_standard_swiglu` is a conventional 9-layer all-attention decoder with a
+  uniform width-1376 SwiGLU and nine-layer residual initialization (54.22M parameters).
+  It tests how an ordinary shallow model behaves without reallocating the removed
+  blocks' parameters. Because the grouped controls deliberately retain 20-layer
+  initialization, this comparison changes initialization as well as width allocation;
+  it is a practical baseline, not a strict one-variable causal isolation.
+
+The configs are:
+
+- [`15a5_wide_swiglu_single_residual_front_blend.yaml`](configs/20l_4k_1b/ablations/15a5_wide_swiglu_single_residual_front_blend.yaml)
+- [`9l_9a0t_grouped_swiglu_9a11_nested_collapse.yaml`](configs/20l_4k_1b/ablations/9l_9a0t_grouped_swiglu_9a11_nested_collapse.yaml)
+- [`9l_9a0t_grouped_triglu_no_rope_ffn.yaml`](configs/20l_4k_1b/ablations/9l_9a0t_grouped_triglu_no_rope_ffn.yaml)
+- [`9l_9a0t_standard_swiglu.yaml`](configs/20l_4k_1b/ablations/9l_9a0t_standard_swiglu.yaml)
+
+A two-step CPU smoke test exercises both the FFN-only and nonuniform-width paths:
+
+```bash
+python -m triglu.train --config configs/smoke_residual_controls.yaml
+```
+
+The guarded follow-up launcher can be started while the preceding final-validation queue
+is still running. It waits for that launcher's exact terminal success marker, rejects
+partial or mismatched destinations, then trains both controls sequentially and benchmarks
+them at 4K, 8K, and 16K:
+
+```bash
+PYTHON_BIN=/path/to/environment/bin/python \
+  bash scripts/run_residual_topology_controls.sh
+```
+
+Set `UPSTREAM_LOG=/path/to/log` only when the latest automatically discovered
+`v0.2.0-ffn-control-final-benchmarks-*.log` is not the queue this run should follow.
+The launcher never overwrites an incomplete run. These are exploratory screens; replicate
+a result at seeds 2357 and 7331 only if it materially changes the release conclusion.
+As elsewhere, 8K and 16K benchmark rows are efficiency extrapolations, not long-context
+quality measurements.
+
+After that queue, run the grouped TriGLU-FFN and conventional shallow baseline with the
+second guarded launcher. It binds to the exact residual-topology log, waits for its
+success marker and lock release, and then trains and benchmarks both new architectures:
+
+```bash
+UPSTREAM_LOG=runs/logs/residual-topology-controls-<timestamp>.log \
+PYTHON_BIN=/path/to/environment/bin/python \
+  bash scripts/run_nine_layer_ffn_controls.sh
+```
+
+### Remaining control launchers
+
+The other reported control runs each have a preflighted launcher with the same
+skip-complete / refuse-to-overwrite semantics and a terminal report regeneration:
+
+- `scripts/run_collapse_control_seeds.sh` — the seed-2357/7331 replications of both
+  parameter-matched 9-layer collapse controls (requires the matched hybrid runs);
+- `scripts/run_combination_and_parallel_controls.sh` — the seed-1337 combination
+  (replacement + TriGLU FFN) and the two single-norm parallel-block probes;
+- `scripts/run_v020_overnight.sh` — the chained confirmation queue used for the
+  matched-seed control replications, probes, and context benchmarks; followed by
+- `scripts/run_v020_post_queue_ablation.sh` — the guarded early-intrusion follow-up,
+  gated on the overnight queue's success marker (`UPSTREAM_LOG` selects the log; it
+  defaults to the newest overnight log present).
+
+Set `PYTHON_BIN` for all of them as above.
+
 ## Evaluation
 
 Evaluate the fixed FineWeb-Edu validation prefix for the reference suite:
@@ -595,16 +852,19 @@ python -m triglu.analyze_rank \
   --output results/generated/20l_4k_1b-15a5t-final-attention-rank-analysis.json
 ```
 
-The schema-v2 JSON separates the complete pre-norm block path into `block_input`,
+The schema-v3 JSON separates each ordinary pre-norm block path into `block_input`,
 `mixer_norm_input`, `mixer_update`, `post_mixer_residual`, `ffn_norm_input`, `ffn_update`,
-and `block_output`. Every stage receives a complete centered channel-covariance spectrum
+and `block_output`. An `ffn_only` structural-control block omits the three nonexistent
+mixer stages and reports only block input, normalized FFN input, FFN update, and block
+output. Every real stage receives a complete centered channel-covariance spectrum
 and numerical rank, stable rank, participation ratio, and entropy effective rank. Derived
 stage transitions show whether the mixer and FFN separately contract or expand the stream.
 Mixer and FFN update/residual RMS ratios and cosine novelty are reported independently.
 
-By default, sensitivity analysis zeros every attention or TriGLU mixer update one layer at
-a time. `--include-ffn-sensitivity` adds the matched FFN interventions, roughly doubling
-the intervention phase. All interventions consume the same deterministic validation prefix.
+By default, sensitivity analysis zeros every present mixer update one layer at a time;
+there is no synthetic mixer intervention for `ffn_only` blocks.
+`--include-ffn-sensitivity` adds the matched FFN interventions, roughly doubling the
+intervention phase. All interventions consume the same deterministic validation prefix.
 They measure model dependence under an out-of-distribution intervention; they are evidence
 about component importance, not a claim that the ablated network is itself well trained.
 
@@ -642,8 +902,9 @@ training_curves.csv          # every logged validation point
 layer_diagnostics.csv        # tidy layer/stage rank metrics when analyses exist
 layer_transitions.csv        # mixer-vs-FFN rank deltas, scale, and direction
 layer_sensitivity.csv        # tidy mixer/FFN intervention metrics
-quality_vs_throughput.svg    # quality vs observed training-log throughput
-validation_loss_curves.svg   # equal-token learning curves
+quality_vs_throughput.svg    # per-architecture quality vs observed throughput, by family
+accuracy_vs_throughput_pareto.svg # Pareto-frontier subset with recommended configs starred
+validation_loss_curves.svg   # learning curves for the baseline and best per family
 validation_loss_curves_zoomed.svg # final 20% with a data-derived tight y-axis
 layer_effective_rank.svg     # cross-plan block-output rank trajectories
 layer_stages-<plan>.svg       # stage-separated rank trajectory for each plan
@@ -800,7 +1061,7 @@ runs/<suite>/<plan>/
   resolved_config.yaml
   environment.json
   data_provenance.json
-  data_manifest.json
+  data_manifest.json             # prepared binary datasets only
   metrics.jsonl
   latest.pt
   checkpoint_step_XXXXXXXX.pt  # only when checkpoint_interval > 0
@@ -821,9 +1082,11 @@ differ.
   not frontier-scale model quality.
 - Dataset order, GPU kernels, compiler behavior, and hardware affect absolute throughput.
   Reproduce comparisons on one software/hardware setup and publish that metadata.
-- Fixed seeds make initialization and the sampled batch sequence identical across plans;
-  they do not make CUDA kernels bitwise deterministic. Compare trends and repeated
-  seeds, not bitwise-identical loss curves.
+- Fixed seeds match sampled batch order and RNG state across plans. Parameter tensors are
+  initialized identically only when their names and shapes match; controls with different
+  projection shapes do not share parameterwise initialization. Fixed seeds also do not
+  make CUDA kernels bitwise deterministic. Compare trends and repeated seeds, not
+  bitwise-identical loss curves.
 - Screening runs use one seed. The two additional focused seeds reduce uncertainty but
   remain a small confirmatory sample; report each seed, dispersion, and confirmatory-only
   conclusions rather than presenting three runs as definitive.

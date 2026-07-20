@@ -2,14 +2,20 @@
 # TriGLU — authoritative framework-agnostic reference
 #
 # Shapes are [batch B, tokens T, channels C]. Every TriGLU operation acts
-# independently at each token. RoPE is position-dependent but does not mix tokens.
+# independently at each token; the component never mixes tokens.
+#
+# The recommended form applies no rotation to K. RoPE on K is an optional
+# variant (TriGLU's ablation origin and the v0.1.0 default) that the controlled
+# experiments found to be the weaker attention replacement; it is retained as a
+# control. It is position-dependent but still does not mix tokens.
 ################################################################################
 
 
 # Parameters of the attention-replacement component:
 #   W_kgv : linear C -> 3C, optionally biased
 #   W_o   : linear C -> C, optionally biased
-#   rope  : rotary embedding over the full C-wide last axis
+#   rope  : optional rotary embedding over the full C-wide last axis
+#           (None in the recommended form)
 
 
 function triglu(X, cache = None, cache_position = 0, use_cache = false):
@@ -19,8 +25,10 @@ function triglu(X, cache = None, cache_position = 0, use_cache = false):
     KGV = W_kgv(X)                               # [B, T, 3C]
     K, G, V = split_last_axis(KGV, into = 3)    # each [B, T, C]
 
-    # Rotate K only. Token t is rotated by its own absolute position.
-    K = rope(K, offset = cache_position)         # [B, T, C]
+    # Optional RoPE variant only (not the recommended form): rotate K by each
+    # token's absolute position. Omit this line for the recommended form.
+    if rope is not None:
+        K = rope(K, offset = cache_position)     # [B, T, C]
 
     # Exact TriGLU equation; both products are elementwise.
     Y = K * silu(G)                              # [B, T, C]
@@ -69,7 +77,9 @@ function decoder_block(
 ################################################################################
 # Hybrid stack
 #
-# layer_types is an explicit per-layer choice from {attention, triglu}.
-# Retained attention layers provide all cross-token information flow. An all-TriGLU
-# stack is useful only as a no-cross-token-mixing diagnostic negative control.
+# layer_types is an explicit per-layer choice; the two primary mixers are
+# {attention, triglu_no_rope} (the latter is the recommended TriGLU form; the
+# RoPE origin variant is named "triglu"). Retained attention layers provide all
+# cross-token information flow. An all-token-local stack is useful only as a
+# no-cross-token-mixing diagnostic negative control.
 ################################################################################

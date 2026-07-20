@@ -40,6 +40,47 @@ attention baseline, while more aggressive replacement increases observed through
 quality cost. These differences motivated focused replication; selection on this same
 seed prevents it from serving as independent confirmation.
 
+The table above uses the RoPE TriGLU mixer, the original component form. The sweeps below
+use the no-RoPE variant, which the confirmatory experiments found to be the stronger
+attention replacement (see [`results.md`](results.md)); they are single-seed screens under
+the same fixed settings.
+
+## No-RoPE replacement-amount ladder (seed 1337)
+
+Nested placement, each larger plan replacing a superset of the smaller plan's layers:
+
+| Plan | Attention | Replaced | Validation loss | Perplexity | Accuracy | Observed train tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `15a5_triglu_no_rope_nested` | 15 | 5 | 3.43916 | 31.1608 | 38.142% | 215,348 |
+| `12a8_triglu_no_rope_nested` | 12 | 8 | 3.44622 | 31.3815 | 38.135% | 227,156 |
+| `9a11_triglu_no_rope_nested` | 9 | 11 | 3.45172 | 31.5546 | 37.978% | 239,619 |
+| `20a0t` (baseline) | 20 | 0 | 3.45719 | 31.7276 | 37.948% | 205,314 |
+| `18a2_triglu_no_rope_nested` | 18 | 2 | 3.46181 | 31.8747 | 37.965% | 204,660 |
+| `6a14_triglu_no_rope_nested` | 6 | 14 | 3.53050 | 34.1410 | 37.256% | 253,986 |
+
+Replacement quality is non-monotonic in amount: too little (two layers) is
+indistinguishable from the baseline, a broad sweet spot spans roughly five to eleven
+replacements, and quality falls off a cliff between eleven (55%) and fourteen (70%)
+replacements while throughput keeps rising. The 55% plan carried forward to confirmatory
+replication.
+
+## No-RoPE placement sweep at 25% replacement (seed 1337)
+
+Five replacements held fixed while their positions move:
+
+| Plan | Zero-based no-RoPE layers | Validation loss | Perplexity | Accuracy | Observed train tok/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `15a5_triglu_no_rope_front_blend` | 8, 12, 15, 17, 19 | 3.43753 | 31.1101 | 38.155% | 214,357 |
+| `15a5_triglu_no_rope_nested` | 7, 11, 15, 17, 19 | 3.43916 | 31.1608 | 38.142% | 215,348 |
+| `15a5_triglu_no_rope_tail_block` | 15, 16, 17, 18, 19 | 3.45096 | 31.5306 | 38.055% | 215,087 |
+| `15a5_triglu_no_rope_early_intrusion` | 3, 12, 15, 17, 19 (front-blend, layer 8 → 3) | 3.45966 | 31.8062 | 37.939% | 215,797 |
+| `15a5_triglu_no_rope_repeating` | 3, 7, 11, 15, 19 | 3.48761 | 32.7077 | 37.652% | 214,804 |
+
+At a fixed amount, throughput is nearly constant while quality spans 0.05 loss: attention-
+rich-front and nested placements lead, and evenly-repeating placement trails. Front-blend
+and early-intrusion were carried to confirmatory replication, where the early-intrusion
+penalty held (see [`results.md`](results.md)).
+
 ## Evidence availability
 
 Mutable local outputs under `runs/` and `results/generated/` are gitignored to prevent

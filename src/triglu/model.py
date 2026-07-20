@@ -1,4 +1,4 @@
-"""Decoder-only causal language model for controlled attention-slot ablations."""
+"""Decoder-only causal language model for controlled mixer and FFN ablations."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import ModelConfig
-from .layers import DecoderBlock, LayerCache, RMSNorm
+from .layers import DecoderBlock, FFNOnlyBlock, LayerCache, RMSNorm
 
 
 @dataclass
@@ -31,8 +31,16 @@ class DecoderLM(nn.Module):
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.blocks = nn.ModuleList(
-            DecoderBlock(config, layer_type)
-            for layer_type in config.layer_types
+            (
+                FFNOnlyBlock(config, config.ffn_hidden_size_for_layer(layer_index))
+                if layer_type == "ffn_only"
+                else DecoderBlock(
+                    config,
+                    layer_type,
+                    config.ffn_hidden_size_for_layer(layer_index),
+                )
+            )
+            for layer_index, layer_type in enumerate(config.layer_types)
         )
         self.final_norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -53,9 +61,16 @@ class DecoderLM(nn.Module):
 
     def _scale_residual_projections(self) -> None:
         # GPT-style scaling keeps the residual-stream variance stable with depth.
-        residual_std = self.config.init_std / math.sqrt(2 * self.config.n_layers)
+        residual_std = self.config.init_std / math.sqrt(
+            2 * self.config.effective_residual_init_depth
+        )
         for block in self.blocks:
-            nn.init.normal_(block.mixer.proj_out.weight, mean=0.0, std=residual_std)
+            if isinstance(block, DecoderBlock):
+                nn.init.normal_(
+                    block.mixer.proj_out.weight,
+                    mean=0.0,
+                    std=residual_std,
+                )
             nn.init.normal_(block.ffn.down_proj.weight, mean=0.0, std=residual_std)
 
     @staticmethod

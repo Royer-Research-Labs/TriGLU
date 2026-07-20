@@ -194,12 +194,19 @@ def test_train_checkpoint_resume_and_standalone_evaluation(tmp_path) -> None:
         output=resumed_dir / "benchmark.json",
     )
     cache_metrics = benchmark["cached_decode"]
+    assert benchmark["schema_version"] == 2
     assert cache_metrics["initial_cache_bytes"] == 384
     assert cache_metrics["final_cache_bytes"] == 512
     assert cache_metrics["cache_capacity_bytes"] == 512
     assert benchmark["benchmark_label"] == "context-scaling"
     assert benchmark["model"]["configured_context_length"] == 4
     assert benchmark["model"]["benchmark_context_length"] == 8
+    assert benchmark["model"]["ffn_type"] == "swiglu"
+    assert benchmark["model"]["block_mode"] == "sequential"
+    assert benchmark["model"]["ffn_hidden_size"] == 16
+    assert benchmark["model"]["ffn_hidden_sizes"] == [16, 16]
+    assert benchmark["model"]["ffn_total_hidden_size"] == 32
+    assert benchmark["model"]["residual_init_depth"] == 2
     assert benchmark["settings"]["cached_decode_kv_cache"] == "preallocated"
 
 
