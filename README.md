@@ -1,6 +1,7 @@
 # TriGLU: a controlled study of replacing attention with token-local gating
 
 [![tests](https://github.com/Royer-Research-Labs/TriGLU/actions/workflows/tests.yml/badge.svg)](https://github.com/Royer-Research-Labs/TriGLU/actions/workflows/tests.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21449950.svg)](https://doi.org/10.5281/zenodo.21449950)
 
 TriGLU—the **Triple-Product Gated Linear Unit**—is a token-local channel mixer,
 `W_o[k · SiLU(g) · v]`, that fell out of an ablation and turned out to improve small
@@ -1094,14 +1095,19 @@ differ.
 ## Citation
 
 ```bibtex
-@misc{royer_triglu,
-  author = {Nick Royer},
-  title  = {TriGLU: Controlled Attention-Replacement Ablations},
-  year   = {2026},
-  note   = {Royer Research Labs, LLC},
-  url    = {https://github.com/Royer-Research-Labs/TriGLU}
+@software{royer_triglu,
+  author  = {Nick Royer},
+  title   = {TriGLU: Controlled Attention-Replacement Ablations},
+  year    = {2026},
+  note    = {Royer Research Labs, LLC},
+  version = {0.2.0},
+  doi     = {10.5281/zenodo.21449950},
+  url     = {https://github.com/Royer-Research-Labs/TriGLU}
 }
 ```
+
+The `doi` above is the all-versions (concept) DOI, which always resolves to the latest
+release; cite `10.5281/zenodo.21449951` for v0.2.0 specifically.
 
 ## License
 

@@ -8,5 +8,10 @@ authors:
     affiliation: "Royer Research Labs, LLC"
 version: 0.2.0
 date-released: 2026-07-20
+doi: 10.5281/zenodo.21449951
 license: Apache-2.0
 repository-code: "https://github.com/Royer-Research-Labs/TriGLU"
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21449950
+    description: "Concept DOI (all versions)"
